@@ -132,7 +132,7 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor, stop: CancellationToken
 
                     let config = thread_config.borrow().clone();
                     if let Err(e) = apply_users(&thread_rtsp, &curr_users).await {
-                        log::error!("Could not setup TLS: {e}");
+                        log::error!("Could not set up the users: {e}");
                     }
 
                     if config.certificate.is_none() && !curr_users.is_empty() {

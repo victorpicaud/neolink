@@ -89,13 +89,27 @@ jobs:
           if (-not $env:OPENSSL_DIR) {
             throw "No OpenSSL with headers in any of $openssl"
           }
-          echo "OPENSSL_DIR=$env:OPENSSL_DIR"
+          # Recent installers keep the libraries apart by C runtime, and Rust
+          # links the dynamic one (MD)
+          $libs = Get-ChildItem -Path (Join-Path $env:OPENSSL_DIR 'lib') -Recurse -Filter 'libssl.lib' -ErrorAction SilentlyContinue
+          $lib = $libs | Where-Object { $_.DirectoryName -match '\\MD$' } | Select-Object -First 1
+          if (-not $lib) {
+            $lib = $libs | Select-Object -First 1
+          }
+          if (-not $lib) {
+            throw "No libssl.lib under $env:OPENSSL_DIR"
+          }
+          $env:OPENSSL_LIB_DIR = $lib.DirectoryName
+          $env:OPENSSL_INCLUDE_DIR = Join-Path $env:OPENSSL_DIR 'include'
+          echo "OPENSSL_LIB_DIR=$env:OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR=$env:OPENSSL_INCLUDE_DIR"
 
           # Set github vars
           Add-Content -Path $env:GITHUB_ENV  -Value "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
           Add-Content -Path $env:GITHUB_PATH  -Value "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\bin"
           Add-Content -Path $env:GITHUB_PATH  -Value "%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin"
           Add-Content -Path $env:GITHUB_ENV  -Value "OPENSSL_DIR=$env:OPENSSL_DIR"
+          Add-Content -Path $env:GITHUB_ENV  -Value "OPENSSL_LIB_DIR=$env:OPENSSL_LIB_DIR"
+          Add-Content -Path $env:GITHUB_ENV  -Value "OPENSSL_INCLUDE_DIR=$env:OPENSSL_INCLUDE_DIR"
 
           # One last check on directories
           dir "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"

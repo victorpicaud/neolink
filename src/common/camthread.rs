@@ -5,6 +5,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::Backoff;
 use crate::{config::CameraConfig, utils::connect_and_login, AnyResult};
 use neolink_core::bc_protocol::BcCamera;
 
@@ -109,21 +110,39 @@ impl NeoCamThread {
     // A watch sender is used to send the new camera
     // whenever it changes
     pub(crate) async fn run(&mut self) -> AnyResult<()> {
-        const MAX_BACKOFF: Duration = Duration::from_secs(5);
-        const MIN_BACKOFF: Duration = Duration::from_millis(50);
+        /// The first wait before connecting again. They then double, with
+        /// jitter, up to the camera's `max_reconnect_backoff`: cameras that
+        /// went away together used to be retried together, every 5s at most.
+        const MIN_BACKOFF: Duration = Duration::from_secs(1);
+        /// A connection that lasted this long worked
+        const HEALTHY: Duration = Duration::from_secs(60);
+        /// How often a refused login is tried again. A refused login used to
+        /// stop the camera for good, until neolink restarted. More often could
+        /// get the account locked.
+        const LOGIN_RETRY: Duration = Duration::from_secs(5 * 60);
 
-        let mut backoff = MIN_BACKOFF;
+        let cancel = self.cancel.clone();
+        let mut backoff = Backoff::new(MIN_BACKOFF, MIN_BACKOFF);
+        let mut max_backoff = None;
 
         loop {
-            self.state
-                .clone()
-                .wait_for(|state| matches!(state, NeoCamThreadState::Connected))
-                .await?;
+            let mut state = self.state.clone();
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                v = state.wait_for(|state| matches!(state, NeoCamThreadState::Connected)) => {
+                    v?;
+                }
+            }
             let mut config_rec = self.config.clone();
 
             let config = config_rec.borrow_and_update().clone();
             let now = Instant::now();
             let name = config.name.clone();
+            let max = Duration::from_secs(config.max_reconnect_backoff);
+            if max_backoff != Some(max) {
+                backoff = Backoff::new(MIN_BACKOFF, max);
+                max_backoff = Some(max);
+            }
 
             let mut state = self.state.clone();
             // Only the requests from now on
@@ -148,52 +167,46 @@ impl NeoCamThread {
             };
             self.camera_watch.send_replace(Weak::new());
 
-            if res.is_none() {
-                // If None go back and reload NOW
+            let Some(result) = res else {
+                // Go back and reload NOW
                 //
                 // This occurs if there was a config change
                 log::trace!("Config change or Manual disconnect");
                 continue;
+            };
+
+            if now.elapsed() >= HEALTHY {
+                backoff.reset();
             }
 
-            // Else we see what the result actually was
-            let result = res.unwrap();
-
-            if now.elapsed() > Duration::from_secs(60) {
-                // Command ran long enough to be considered a success
-                backoff = MIN_BACKOFF;
-            }
-            if backoff > MAX_BACKOFF {
-                backoff = MAX_BACKOFF;
-            }
-
-            match result {
+            let delay = match result {
                 Ok(()) => {
                     // Normal shutdown
                     log::trace!("Normal camera shutdown");
                     self.cancel.cancel();
                     return Ok(());
                 }
-                Err(e) => {
-                    // An error
-                    // Check if it is non-retry
-                    let e_inner = e.downcast_ref::<neolink_core::Error>();
-                    match e_inner {
-                        Some(neolink_core::Error::CameraLoginFail) => {
-                            // Fatal
-                            log::error!("{name}: Login credentials were not accepted");
-                            self.cancel.cancel();
-                            return Err(e);
-                        }
-                        _ => {
-                            // Non fatal
-                            log::warn!("{name}: Connection Lost: {:?}", e);
-                            log::info!("{name}: Attempt reconnect in {:?}", backoff);
-                            sleep(backoff).await;
-                            backoff *= 2;
-                        }
+                Err(e) => match e.downcast_ref::<neolink_core::Error>() {
+                    Some(neolink_core::Error::CameraLoginFail { code }) => {
+                        log::error!(
+                            "{name}: The camera refused the login with code {code}: check the username and password. Trying again in {} minutes",
+                            LOGIN_RETRY.as_secs() / 60
+                        );
+                        LOGIN_RETRY
                     }
-                }
+                    _ => {
+                        let delay = backoff.next_delay();
+                        log::warn!("{name}: Connection Lost: {:?}", e);
+                        log::info!("{name}: Attempt reconnect in {delay:.1?}");
+                        delay
+                    }
+                },
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = sleep(delay) => {}
+                // A new config may well fix it
+                Ok(_) = config_rec.changed() => {}
             }
         }
     }

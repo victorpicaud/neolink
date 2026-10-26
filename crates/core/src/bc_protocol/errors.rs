@@ -56,9 +56,13 @@ pub enum Error {
         code: u16,
     },
 
-    /// Raised when the camera responds with a status code over than OK during login
-    #[error("Camera responded with Err during login")]
-    CameraLoginFail,
+    /// Raised when the camera refuses the login: wrong credentials, or an
+    /// account it locked
+    #[error("The camera refused the login with code {code}")]
+    CameraLoginFail {
+        /// The camera's response code
+        code: u16,
+    },
 
     /// Raised when a connection is dropped.
     #[error("Dropped connection")]

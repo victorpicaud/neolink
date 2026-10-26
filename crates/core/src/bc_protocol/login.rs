@@ -133,7 +133,9 @@ impl BcCamera {
             sub_login.send(modern_login).await?;
             let modern_reply = sub_login.recv().await?;
             if modern_reply.meta.response_code != 200 {
-                return Err(Error::CameraLoginFail);
+                return Err(Error::CameraLoginFail {
+                    code: modern_reply.meta.response_code,
+                });
             }
 
             match modern_reply.body {

@@ -71,22 +71,27 @@ impl NeoReactor {
                                 let _ = reply.send(thread_config_tx.subscribe());
                             }
                             NeoReactorCommand::Get(name, sender) => {
+                                // A camera whose actor ended answers nothing:
+                                // it starts again instead
+                                if instances.get(&name).is_some_and(NeoCam::is_dead) {
+                                    log::info!("{name}: Starting the camera again");
+                                    instances.remove(&name);
+                                }
+                                // A camera that fails to start fails the
+                                // request, and no longer every camera with it
                                 let new = match instances.entry(name.clone()) {
-                                    Entry::Occupied(occ) => Result::Ok(Some(occ.get().subscribe().await?)),
+                                    Entry::Occupied(occ) => occ.get().subscribe().await.map(Some),
                                     Entry::Vacant(vac) => {
                                         let current_config: Config = (*thread_config_tx.borrow()).clone();
                                         if let Some(config) = current_config.cameras.iter().find(|cam| cam.name == name).cloned() {
                                             #[cfg(feature = "pushnoti")]
-                                            let cam = NeoCam::new(config, push_noti.clone()).await?;
+                                            let cam = NeoCam::new(config, push_noti.clone()).await;
                                             #[cfg(not(feature = "pushnoti"))]
-                                            let cam = NeoCam::new(config).await?;
-                                            Result::Ok(Some(
-                                                vac.insert(
-                                                    cam,
-                                                )
-                                                .subscribe()
-                                                .await?
-                                            ))
+                                            let cam = NeoCam::new(config).await;
+                                            match cam {
+                                                Ok(cam) => vac.insert(cam).subscribe().await.map(Some),
+                                                Err(e) => Err(e),
+                                            }
                                         } else {
                                             Result::Ok(None)
                                         }

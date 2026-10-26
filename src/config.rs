@@ -219,6 +219,17 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
     pub(crate) idle_disconnect: bool,
+
+    #[validate(range(
+        min = 1,
+        max = 3600,
+        message = "Invalid max reconnect backoff (it's in seconds)",
+        code = "max_reconnect_backoff"
+    ))]
+    /// The longest wait between two attempts to connect to the camera, in
+    /// seconds
+    #[serde(default = "default_max_reconnect_backoff")]
+    pub(crate) max_reconnect_backoff: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -501,6 +512,10 @@ fn default_pause() -> PauseConfig {
 
 fn default_buffer_duration() -> u64 {
     3000
+}
+
+fn default_max_reconnect_backoff() -> u64 {
+    60
 }
 
 fn default_max_discovery_retries() -> usize {

@@ -443,6 +443,11 @@ impl NeoCam {
         Ok(me)
     }
 
+    /// Whether the camera's actor ended: it no longer answers
+    pub(crate) fn is_dead(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
     pub(crate) async fn subscribe(&self) -> Result<NeoInstance> {
         NeoInstance::new(
             self.camera_watch.clone(),

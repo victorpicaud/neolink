@@ -75,6 +75,18 @@ pub(crate) use bc_protocol::{Credentials, Result};
 
 pub(crate) type NomErrorType<'a> = nom::error::VerboseError<&'a [u8]>;
 
+/// Runs the async part of a `Drop` on the current tokio runtime. Without one,
+/// as while the process exits, the cleanup is dropped instead: `Handle::current`
+/// would panic, and a panic in a `Drop` can abort the process.
+pub(crate) fn spawn_cleanup<F>(cleanup: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(cleanup);
+    }
+}
+
 // Adapted from vertoforce/neolink@105e4b2 (same AGPL-3.0 project).
 /// Server-side (fake camera) codec helpers.
 ///
@@ -215,5 +227,13 @@ pub mod test_server {
             password: Some(password.to_string()),
         }
         .make_aeskey(nonce)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cleanup_without_a_runtime_is_dropped_not_a_panic() {
+        super::spawn_cleanup(async {});
     }
 }

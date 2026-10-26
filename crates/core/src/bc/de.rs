@@ -94,7 +94,13 @@ fn bc_modern_msg<'a>(
     let ext_len = header.payload_offset.unwrap_or_default();
 
     let (buf, ext_buf) = take(ext_len)(buf)?;
-    let payload_len = header.body_len - ext_len;
+    let payload_len = header.body_len.checked_sub(ext_len).ok_or_else(|| {
+        Err::Error(make_error(
+            buf,
+            "Payload offset is past the end of the body",
+            ErrorKind::Verify,
+        ))
+    })?;
     let (buf, payload_buf) = take(payload_len)(buf)?;
 
     let decrypted;
@@ -184,8 +190,11 @@ fn bc_modern_msg<'a>(
                     // if if context.debug {
                     //     log::trace!("Binary: {:X?}", &processed_payload_buf[0..30]);
                     // }
+                    // The camera says how much is encrypted, which cannot be
+                    // allowed to reach past the payload
+                    let encrypted_len = processed_payload_buf.len().min(encrypted_len as usize);
                     Some(BcPayloads::Binary(
-                        processed_payload_buf[0..(encrypted_len as usize)].to_vec(),
+                        processed_payload_buf[0..encrypted_len].to_vec(),
                     ))
                 }
                 _ => Some(BcPayloads::Binary(payload_buf.to_vec())),
@@ -265,6 +274,54 @@ mod tests {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
             .is_test(true)
             .try_init();
+    }
+
+    fn header(body_len: u32, payload_offset: u32) -> BcHeader {
+        BcHeader {
+            body_len,
+            msg_id: 3,
+            channel_id: 0,
+            stream_type: 0,
+            msg_num: 0,
+            response_code: 200,
+            class: 0x0000,
+            payload_offset: Some(payload_offset),
+        }
+    }
+
+    #[test]
+    fn a_payload_offset_past_the_body_is_an_error() {
+        init();
+        let context = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
+        let buf = [0u8; 32];
+        assert!(bc_body(&context, &header(4, 10), &buf).is_err());
+    }
+
+    #[test]
+    fn an_encrypt_len_past_the_payload_is_clamped() {
+        init();
+        let protocol = EncryptionProtocol::full_aes([7; 16]);
+        let context = BcContext::new_with_encryption(protocol.clone());
+        let extension = protocol.encrypt(
+            0,
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n\
+              <Extension version=\"1.1\">\n\
+              <binaryData>1</binaryData>\n\
+              <encryptLen>9999</encryptLen>\n\
+              </Extension>\n",
+        );
+        let mut buf = extension.clone();
+        buf.extend_from_slice(&[0x5a; 16]);
+
+        let header = header(buf.len() as u32, extension.len() as u32);
+        let (_, body) = bc_body(&context, &header, &buf).expect("a binary payload");
+        assert_matches!(
+            body,
+            BcBody::ModernMsg(ModernMsg {
+                payload: Some(BcPayloads::Binary(data)),
+                ..
+            }) if data.len() == 16
+        );
     }
 
     #[test]

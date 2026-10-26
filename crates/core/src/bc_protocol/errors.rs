@@ -288,10 +288,49 @@ impl From<tokio::time::error::Elapsed> for Error {
 impl<'a> From<nom::Err<NomErrorType<'a>>> for Error {
     fn from(k: nom::Err<NomErrorType<'a>>) -> Self {
         match k {
-            nom::Err::Error(e) => Error::NomError(format!("Nom Error: {:X?}", e)),
-            nom::Err::Failure(e) => Error::NomError(format!("Nom Error: {:X?}", e)),
+            nom::Err::Error(e) | nom::Err::Failure(e) => {
+                Error::NomError(format!("Nom Error: {}", describe_nom_error(&e)))
+            }
             nom::Err::Incomplete(nom::Needed::Size(amount)) => Error::NomIncomplete(amount.get()),
             nom::Err::Incomplete(nom::Needed::Unknown) => Error::NomIncomplete(1),
         }
+    }
+}
+
+/// Describes a parse error without its input: each position the error passed
+/// through held the rest of the buffer, which can be a whole media packet, and
+/// the text used to include all of it in hex.
+fn describe_nom_error(e: &NomErrorType) -> String {
+    const SHOWN: usize = 16;
+    e.errors
+        .iter()
+        .map(|(input, kind)| {
+            let more = if input.len() > SHOWN { " ..." } else { "" };
+            format!(
+                "{kind:?} at {:02X?}{more} ({} bytes)",
+                &input[..input.len().min(SHOWN)],
+                input.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_parse_error_does_not_copy_its_input() {
+        let input = vec![0xab; 1024 * 1024];
+        let e: nom::Err<NomErrorType> = nom::Err::Error(nom::error::VerboseError {
+            errors: vec![(
+                &input[..],
+                nom::error::VerboseErrorKind::Context("Magic invalid"),
+            )],
+        });
+        let text = Error::from(e).to_string();
+        assert!(text.len() < 300, "{} bytes: {text}", text.len());
+        assert!(text.contains("Magic invalid"), "{text}");
     }
 }

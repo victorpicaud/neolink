@@ -268,7 +268,10 @@ fn bcmedia_aac(buf: &[u8]) -> IResult<&[u8], BcMediaAac> {
 fn bcmedia_adpcm(buf: &[u8]) -> IResult<&[u8], BcMediaAdpcm> {
     const SUB_HEADER_SIZE: u16 = 4;
 
-    let (buf, payload_size) = le_u16(buf)?;
+    let (buf, payload_size) = context(
+        "ADPCM payload is shorter than its header",
+        verify(le_u16, |x| *x >= SUB_HEADER_SIZE),
+    )(buf)?;
     let (buf, _payload_size_b) = le_u16(buf)?;
     let (buf, _magic) = context(
         "ADPCM data magic value is invalid",
@@ -308,6 +311,21 @@ mod tests {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
             .is_test(true)
             .try_init();
+    }
+
+    #[test]
+    // The sizes come off the wire: one too small used to underflow
+    fn an_adpcm_payload_shorter_than_its_header_is_an_error() {
+        init();
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&MAGIC_HEADER_BCMEDIA_ADPCM.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&MAGIC_HEADER_BCMEDIA_ADPCM_DATA.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&[0; 64]);
+
+        assert!(BcMedia::deserialize(&mut buf).is_err());
     }
 
     #[test]

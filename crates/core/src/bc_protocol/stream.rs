@@ -47,15 +47,19 @@ impl StreamData {
     /// Pull data from the camera's buffer
     /// This returns raw BcMedia packets
     pub async fn get_data(&mut self) -> Result<Result<BcMedia>> {
-        if let Some(handle) = self.handle.as_mut() {
-            if handle.is_finished() {
+        match self.handle.take() {
+            Some(handle) if handle.is_finished() => {
+                // Taken, so that it is only awaited once: awaiting a finished
+                // handle again panics
                 self.abort_handle.cancel();
                 handle.await??;
                 return Err(Error::StreamFinished);
             }
-        } else {
-            self.abort_handle.cancel();
-            return Err(Error::StreamFinished);
+            Some(handle) => self.handle = Some(handle),
+            None => {
+                self.abort_handle.cancel();
+                return Err(Error::StreamFinished);
+            }
         }
         match self.rx.recv().await {
             Some(data) => Ok(data),
@@ -80,14 +84,10 @@ impl StreamData {
 impl Drop for StreamData {
     fn drop(&mut self) {
         log::trace!("Drop StreamData");
+        // The task stops on its own once cancelled, so there is nothing to
+        // wait for, and no runtime is needed here
         self.abort_handle.cancel();
-        if let Some(handle) = self.handle.take() {
-            let _gt = tokio::runtime::Handle::current().enter();
-            tokio::task::spawn(async move {
-                let _ = handle.await;
-            });
-        }
-        log::trace!("Dropped MotionData");
+        log::trace!("Dropped StreamData");
     }
 }
 
@@ -346,5 +346,28 @@ impl BcCamera {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reading_past_the_end_of_a_stream_never_panics() {
+        let (_tx, rx) = channel(1);
+        let mut data = StreamData {
+            handle: Some(tokio::spawn(async { Ok(()) })),
+            rx,
+            abort_handle: CancellationToken::new(),
+        };
+        while !data.handle.as_ref().is_some_and(|h| h.is_finished()) {
+            tokio::task::yield_now().await;
+        }
+
+        // Awaiting the finished task a second time used to panic
+        assert!(matches!(data.get_data().await, Err(Error::StreamFinished)));
+        assert!(matches!(data.get_data().await, Err(Error::StreamFinished)));
+        assert!(data.shutdown().await.is_ok());
     }
 }

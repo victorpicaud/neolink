@@ -1014,9 +1014,8 @@ impl Drop for Discoverer {
     fn drop(&mut self) {
         log::trace!("Drop Discoverer");
         self.cancel.cancel();
-        let _gt = tokio::runtime::Handle::current().enter();
         let mut handle = std::mem::take(&mut self.handle);
-        tokio::task::spawn(async move { while handle.get_mut().join_next().await.is_some() {} });
+        crate::spawn_cleanup(async move { while handle.get_mut().join_next().await.is_some() {} });
         log::trace!("Dropped Discoverer");
     }
 }

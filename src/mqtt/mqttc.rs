@@ -103,8 +103,7 @@ impl Drop for Mqtt {
         let cancel = self.cancel.clone();
         let mut set = std::mem::take(&mut self.set);
 
-        let _gt = tokio::runtime::Handle::current().enter();
-        tokio::task::spawn(async move {
+        crate::utils::spawn_cleanup(async move {
             let (tx, rx) = oneshot();
             let _ = outgoing_tx.send(MqttRequest::HangUp(tx)).await;
             let _ = rx.await;

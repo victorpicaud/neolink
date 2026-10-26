@@ -329,11 +329,9 @@ where
 {
     fn drop(&mut self) {
         if let (Some(command), Some(instance)) = (self.command.take(), self.instance.take()) {
-            let _gt = tokio::runtime::Handle::current().enter();
             let timeout = self.timeout;
-            tokio::task::spawn(async move {
-                tokio::time::timeout(timeout, instance.run_passive_task(*command)).await??;
-                crate::AnyResult::Ok(())
+            crate::utils::spawn_cleanup(async move {
+                let _ = tokio::time::timeout(timeout, instance.run_passive_task(*command)).await;
             });
         }
     }

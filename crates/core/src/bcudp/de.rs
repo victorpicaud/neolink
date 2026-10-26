@@ -70,8 +70,13 @@ fn udp_disc(buf: &[u8]) -> IResult<&[u8], UdpDiscovery> {
     let (buf, checksum) = error_context("DISC: Missing checksum", le_u32)(buf)?;
     let (buf, enc_data_slice) = take(payload_size)(buf)?;
 
-    let actual_checksum = calc_crc(enc_data_slice);
-    assert_eq!(checksum, actual_checksum);
+    if calc_crc(enc_data_slice) != checksum {
+        return Err(Err::Error(make_error(
+            buf,
+            "DISC: Checksum mismatch",
+            ErrorKind::Verify,
+        )));
+    }
 
     let decrypted_payload = decrypt(tid, enc_data_slice);
     let payload = UdpXml::try_parse(decrypted_payload.as_slice()).map_err(|e| {
@@ -175,6 +180,18 @@ mod tests {
                 }),
             }))
         );
+    }
+
+    #[test]
+    // Any host on the LAN can send this, so it must be an error, not a panic
+    fn a_discovery_packet_with_a_bad_checksum_is_rejected() {
+        init();
+
+        let mut sample = include_bytes!("samples/udp_negotiate_disc.bin").to_vec();
+        sample[16] ^= 0xff;
+
+        let e = BcUdp::deserialize(&mut BytesMut::from(&sample[..]));
+        assert!(e.is_err());
     }
 
     #[test]

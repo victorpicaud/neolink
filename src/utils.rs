@@ -20,6 +20,18 @@ where
     tokio::time::timeout(tokio::time::Duration::from_secs(15), future)
 }
 
+/// Runs the async part of a `Drop` on the current tokio runtime. Without one,
+/// as while the process exits, the cleanup is dropped instead: `Handle::current`
+/// would panic, and a panic in a `Drop` can abort the process.
+pub(crate) fn spawn_cleanup<F>(cleanup: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(cleanup);
+    }
+}
+
 pub(crate) enum AddressOrUid {
     Address(String),
     #[allow(dead_code)]

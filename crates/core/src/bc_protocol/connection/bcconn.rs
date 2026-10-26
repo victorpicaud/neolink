@@ -190,9 +190,8 @@ impl Drop for BcConnection {
         self.cancel.cancel();
 
         let poll_commander = self.poll_commander.clone();
-        let _gt = tokio::runtime::Handle::current().enter();
         let mut threads = std::mem::take(&mut self.rx_thread);
-        tokio::task::spawn(async move {
+        crate::spawn_cleanup(async move {
             let _ = poll_commander.send(PollCommand::Disconnect).await;
             let locked_threads = threads.get_mut();
             while locked_threads.join_next().await.is_some() {}

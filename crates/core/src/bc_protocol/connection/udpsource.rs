@@ -280,9 +280,8 @@ impl Drop for UdpPayloadSource {
     fn drop(&mut self) {
         log::trace!("Drop UdpPayloadSource");
         self.cancel_token.cancel();
-        let _gt = tokio::runtime::Handle::current().enter();
         let mut set = std::mem::take(&mut self.set);
-        tokio::task::spawn(async move {
+        crate::spawn_cleanup(async move {
             while set.join_next().await.is_some() {}
             log::trace!("Dropped UdpPayloadSource");
         });
@@ -621,9 +620,8 @@ impl Drop for UdpPayloadInner {
     fn drop(&mut self) {
         log::trace!("Drop UdpPayloadInner");
         self.cancel.cancel();
-        let _gt = tokio::runtime::Handle::current().enter();
         let mut set = std::mem::take(&mut self.set);
-        tokio::task::spawn(async move {
+        crate::spawn_cleanup(async move {
             while set.join_next().await.is_some() {}
             log::trace!("Dropped UdpPayloadInner");
         });

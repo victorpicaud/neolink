@@ -179,8 +179,7 @@ impl Drop for NeoReactor {
                 log::trace!("Drop NeoReactor");
                 self.cancel.cancel();
                 let commander = self.commander.clone();
-                let _gt = tokio::runtime::Handle::current().enter();
-                tokio::task::spawn(async move {
+                crate::utils::spawn_cleanup(async move {
                     let _ = commander.send(NeoReactorCommand::HangUp).await;
                     while set.join_next().await.is_some() {}
                     log::trace!("Dropped NeoReactor");

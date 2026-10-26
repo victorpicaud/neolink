@@ -414,8 +414,7 @@ impl Drop for NeoCam {
         log::trace!("Drop NeoCam");
         let mut set = std::mem::take(&mut self.set);
         let commander = self.commander.clone();
-        let _gt = tokio::runtime::Handle::current().enter();
-        tokio::task::spawn(async move {
+        crate::utils::spawn_cleanup(async move {
             let _ = commander.send(NeoCamCommand::HangUp).await;
             while set.join_next().await.is_some() {}
             log::trace!("Dropped NeoCam");

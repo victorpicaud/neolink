@@ -333,7 +333,6 @@ struct ClientPipeline {
     element: Element,
     vid_src: Option<AppSrc>,
     aud_src: Option<AppSrc>,
-    stream_config: StreamConfig,
     /// The frames received while learning the stream type
     buffered: Vec<BcMedia>,
     media_rx: MpscReceiver<BcMedia>,
@@ -400,7 +399,6 @@ async fn prepare_client(
         element,
         vid_src,
         aud_src,
-        stream_config,
         buffered,
         media_rx,
     })
@@ -427,7 +425,6 @@ impl ClientPipeline {
             element,
             vid_src,
             aud_src,
-            stream_config,
             buffered,
             mut media_rx,
         } = self;
@@ -467,7 +464,7 @@ impl ClientPipeline {
             };
             if let Some(frame) = frame {
                 if let Err(e) =
-                    send_to_sources(frame, &vid_src, &aud_src, &mut state, &stream_config)
+                    send_to_sources(frame, &vid_src, &aud_src, &mut state, Instant::now())
                 {
                     log::warn!("{name}::{stream}: Could not stream to a client: {e:#}");
                     return;
@@ -487,14 +484,26 @@ impl ClientPipeline {
     }
 }
 
+/// The least time between two video frames, in microseconds: frames that came
+/// together still need timestamps a client can tell apart
+const MIN_FRAME_GAP: u64 = 1_000;
+/// How far audio may drift from the arrival of its frames, in microseconds,
+/// before it follows them again
+const MAX_AUDIO_DRIFT: u64 = 200_000;
+
 /// Per-client state of the frame pump
 #[derive(Default)]
 struct PumpState {
-    /// Timestamp of the next video buffer in microseconds. A u32 wrapped after
-    /// 71.6 minutes, and the jump back to zero froze the stream.
-    vid_ts: u64,
-    /// Timestamp of the next audio buffer in microseconds
-    aud_ts: u64,
+    /// When the client's clock started: when the first frame it took arrived.
+    /// Frames are stamped with when they arrive. Counting them at the frame
+    /// rate the camera claimed drifted from real time as soon as it sent more
+    /// or fewer, and clients fell further and further behind (#209, #378).
+    epoch: Option<Instant>,
+    /// Timestamp of the last video buffer in microseconds. A u32 wrapped
+    /// after 71.6 minutes, and the jump back to zero froze the stream.
+    vid_ts: Option<u64>,
+    /// Where the next audio buffer starts, in microseconds
+    aud_ts: Option<u64>,
     /// Video was dropped, so P-frames are skipped until the next keyframe: a
     /// decoder cannot use them without the frames they reference.
     need_keyframe: bool,
@@ -503,12 +512,55 @@ struct PumpState {
     refused: bool,
 }
 
+impl PumpState {
+    /// Microseconds since the client's clock started, starting it if need be
+    fn arrival(&mut self, now: Instant) -> u64 {
+        let epoch = *self.epoch.get_or_insert(now);
+        now.saturating_duration_since(epoch).as_micros() as u64
+    }
+
+    /// The timestamp of a video frame: when it arrived, and after the frame
+    /// before. The frames kept for a new client all arrive at once, and play
+    /// at once.
+    fn video_ts(&self, arrival: u64) -> u64 {
+        match self.vid_ts {
+            Some(last) => arrival.max(last + MIN_FRAME_GAP),
+            None => arrival,
+        }
+    }
+
+    /// The timestamp of an audio frame, or None to drop it. Audio keeps its
+    /// own clock, which a gap or a jittery arrival would only break up, unless
+    /// it drifts too far from the arrival of the frames.
+    fn audio_ts(&mut self, arrival: u64, duration: u32) -> Option<u64> {
+        let mut ts = self.aud_ts.unwrap_or(arrival);
+        if ts + MAX_AUDIO_DRIFT < arrival {
+            // Audio went missing for a while
+            ts = arrival;
+        } else if ts > arrival + MAX_AUDIO_DRIFT {
+            // A burst of old audio, more than there was time for
+            return None;
+        }
+        self.aud_ts = Some(ts + u64::from(duration));
+        Some(ts)
+    }
+
+    /// The client is not playing. When it does, its media starts at zero, and
+    /// at a keyframe.
+    fn restart(&mut self) {
+        self.epoch = None;
+        self.vid_ts = None;
+        self.aud_ts = None;
+        self.need_keyframe = true;
+    }
+}
+
 fn send_to_sources(
     data: BcMedia,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     state: &mut PumpState,
-    stream_config: &StreamConfig,
+    now: Instant,
 ) -> AnyResult<()> {
     match data {
         BcMedia::Aac(aac) => {
@@ -516,41 +568,49 @@ fn send_to_sources(
                 log::debug!("Dropping AAC frame with an unreadable header");
                 return Ok(());
             };
-            if let Some(aud_src) = aud_src.as_ref() {
-                send_audio(aud_src, aac.data, state.aud_ts)?;
-            }
-            state.aud_ts += u64::from(duration);
+            send_audio(aud_src, aac.data, duration, state, now)?;
         }
         BcMedia::Adpcm(adpcm) => {
             let Some(duration) = adpcm.duration() else {
                 log::debug!("Dropping ADPCM frame with an unreadable header");
                 return Ok(());
             };
-            if let Some(aud_src) = aud_src.as_ref() {
-                send_audio(aud_src, adpcm.data, state.aud_ts)?;
-            }
-            state.aud_ts += u64::from(duration);
+            send_audio(aud_src, adpcm.data, duration, state, now)?;
         }
         BcMedia::Iframe(BcMediaIframe { data, .. }) => {
-            send_video(vid_src, data, true, state)?;
-            state.vid_ts += stream_config.frame_period().as_micros() as u64;
+            send_video(vid_src, data, true, state, now)?;
         }
         BcMedia::Pframe(BcMediaPframe { data, .. }) => {
-            send_video(vid_src, data, false, state)?;
-            state.vid_ts += stream_config.frame_period().as_micros() as u64;
+            send_video(vid_src, data, false, state, now)?;
         }
         _ => {}
     }
     Ok(())
 }
 
-fn send_audio(aud_src: &AppSrc, data: Vec<u8>, ts: u64) -> AnyResult<()> {
+fn send_audio(
+    aud_src: &Option<AppSrc>,
+    data: Vec<u8>,
+    duration: u32,
+    state: &mut PumpState,
+    now: Instant,
+) -> AnyResult<()> {
+    let Some(aud_src) = aud_src.as_ref() else {
+        return Ok(());
+    };
     if is_full(aud_src) {
         log::trace!("Audio source is full, dropping a frame");
         return Ok(());
     }
+    let arrival = state.arrival(now);
+    let Some(ts) = state.audio_ts(arrival, duration) else {
+        log::trace!("Audio is ahead of time, dropping a frame");
+        return Ok(());
+    };
     log::trace!("Sending audio: {:?}", Duration::from_micros(ts));
-    send_to_appsrc(aud_src, data, Duration::from_micros(ts))?;
+    if !send_to_appsrc(aud_src, data, Duration::from_micros(ts))? {
+        state.restart();
+    }
     Ok(())
 }
 
@@ -559,6 +619,7 @@ fn send_video(
     data: Vec<u8>,
     keyframe: bool,
     state: &mut PumpState,
+    now: Instant,
 ) -> AnyResult<()> {
     let Some(vid_src) = vid_src.as_ref() else {
         return Ok(());
@@ -572,15 +633,17 @@ fn send_video(
         state.need_keyframe = true;
         return Ok(());
     }
-    log::trace!("Sending video: {:?}", Duration::from_micros(state.vid_ts));
-    if send_to_appsrc(vid_src, data, Duration::from_micros(state.vid_ts))? {
+    let arrival = state.arrival(now);
+    let ts = state.video_ts(arrival);
+    log::trace!("Sending video: {:?}", Duration::from_micros(ts));
+    if send_to_appsrc(vid_src, data, Duration::from_micros(ts))? {
+        state.vid_ts = Some(ts);
         state.refused = false;
         if keyframe {
             state.need_keyframe = false;
         }
     } else {
-        // The client will play from a later keyframe
-        state.need_keyframe = true;
+        state.restart();
         if !state.refused {
             state.refused = true;
             log::debug!(
@@ -1258,14 +1321,7 @@ mod tests {
         let mut state = PumpState::default();
         for i in 0..2048 {
             let len = 257 + i * 31;
-            send_to_sources(
-                frame(false, len),
-                &src,
-                &None,
-                &mut state,
-                &stream_config(25),
-            )
-            .unwrap();
+            send_to_sources(frame(false, len), &src, &None, &mut state, Instant::now()).unwrap();
         }
         let (fds_after, rss_after) = (fds(), rss());
         pipeline.set_state(gstreamer::State::Null).unwrap();
@@ -1284,36 +1340,157 @@ mod tests {
 
     #[test]
     fn timestamps_pass_the_u32_microsecond_boundary() {
-        let start = u64::from(u32::MAX - 100);
-        let mut state = PumpState {
-            vid_ts: start,
-            aud_ts: start,
-            ..Default::default()
-        };
-        send_to_sources(
-            frame(false, 16),
-            &None,
-            &None,
-            &mut state,
-            &stream_config(25),
-        )
-        .unwrap();
-        assert_eq!(state.vid_ts, start + 40_000);
-
-        let aac = BcMedia::Aac(BcMediaAac {
-            data: vec![0xff, 0xf1, 0x60, 0, 0, 0, 0, 0],
-        });
-        send_to_sources(aac, &None, &None, &mut state, &stream_config(25)).unwrap();
-        let adpcm = BcMedia::Adpcm(BcMediaAdpcm { data: vec![0; 260] });
-        send_to_sources(adpcm, &None, &None, &mut state, &stream_config(25)).unwrap();
-        assert!(state.aud_ts > u64::from(u32::MAX));
+        let start = Instant::now();
+        let mut state = PumpState::default();
+        state.arrival(start);
+        let later = state.arrival(start + Duration::from_secs(72 * 60));
+        assert!(state.video_ts(later) > u64::from(u32::MAX));
+        assert!(state.audio_ts(later, 64_000).unwrap() > u64::from(u32::MAX));
     }
 
     #[test]
     fn zero_fps_falls_back_instead_of_dividing_by_zero() {
+        assert_eq!(stream_config(0).frame_period(), Duration::from_millis(40));
+    }
+
+    /// The timestamps of the buffers that leave `src`, in microseconds
+    fn timestamps(src: &AppSrc) -> Arc<Mutex<Vec<u64>>> {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let probe_seen = seen.clone();
+        src.static_pad("src").unwrap().add_probe(
+            gstreamer::PadProbeType::BUFFER,
+            move |_, info| {
+                if let Some(buffer) = info.buffer() {
+                    let pts = buffer.pts().map_or(u64::MAX, |pts| pts.useconds());
+                    probe_seen.lock().unwrap().push(pts);
+                }
+                gstreamer::PadProbeReturn::Ok
+            },
+        );
+        seen
+    }
+
+    /// The first `n` timestamps seen, waiting a little for them
+    fn first(seen: &Mutex<Vec<u64>>, n: usize) -> Vec<u64> {
+        for _ in 0..200 {
+            if seen.lock().unwrap().len() >= n {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        seen.lock().unwrap().iter().take(n).copied().collect()
+    }
+
+    #[test]
+    fn video_is_stamped_with_when_it_arrived() {
+        let (pipeline, src) = appsrc_pipeline(1024 * 1024);
+        let seen = timestamps(&src);
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let vid_src = Some(src);
         let mut state = PumpState::default();
-        send_to_sources(frame(true, 16), &None, &None, &mut state, &stream_config(0)).unwrap();
-        assert_eq!(state.vid_ts, 40_000);
+        // The camera claims 25 fps, and sends 10
+        let start = Instant::now();
+        for n in 0..4 {
+            let arrival = start + Duration::from_millis(100 * n);
+            send_to_sources(frame(n == 0, 16), &vid_src, &None, &mut state, arrival).unwrap();
+        }
+        let stamps = first(&seen, 4);
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        assert_eq!(stamps, [0, 100_000, 200_000, 300_000]);
+    }
+
+    #[test]
+    fn video_that_arrives_at_once_keeps_its_order() {
+        let (pipeline, src) = appsrc_pipeline(1024 * 1024);
+        let seen = timestamps(&src);
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let vid_src = Some(src);
+        let mut state = PumpState::default();
+        let now = Instant::now();
+        for n in 0..4 {
+            send_to_sources(frame(n == 0, 16), &vid_src, &None, &mut state, now).unwrap();
+        }
+        let stamps = first(&seen, 4);
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        assert_eq!(stamps, [0, 1_000, 2_000, 3_000]);
+    }
+
+    #[test]
+    fn audio_keeps_its_own_clock_near_the_arrival_of_its_frames() {
+        let start = Instant::now();
+        let mut state = PumpState::default();
+        let mut at = |ms: u64| {
+            let arrival = state.arrival(start + Duration::from_millis(ms));
+            state.audio_ts(arrival, 64_000)
+        };
+        // A little early or late: its own clock
+        assert_eq!(at(0), Some(0));
+        assert_eq!(at(70), Some(64_000));
+        assert_eq!(at(120), Some(128_000));
+        // After a gap: when it came
+        assert_eq!(at(1_000), Some(1_000_000));
+        // A burst of late audio: what gets too far ahead is dropped
+        let burst: Vec<_> = (0..5).map(|_| at(1_010)).collect();
+        assert_eq!(
+            burst,
+            [
+                Some(1_064_000),
+                Some(1_128_000),
+                Some(1_192_000),
+                None,
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_frames_follow_one_another() {
+        let (pipeline, src) = appsrc_pipeline(1024 * 1024);
+        let seen = timestamps(&src);
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let aud_src = Some(src);
+        let mut state = PumpState::default();
+        // AAC at 16 kHz, and IMA ADPCM at 8 kHz
+        let aac = BcMediaAac {
+            data: vec![0xff, 0xf1, 0x60, 0, 0, 0, 0, 0],
+        };
+        let adpcm = BcMediaAdpcm { data: vec![0; 260] };
+        let aac_duration = u64::from(aac.duration().unwrap());
+        let start = Instant::now();
+        send_to_sources(
+            BcMedia::Aac(aac.clone()),
+            &None,
+            &aud_src,
+            &mut state,
+            start,
+        )
+        .unwrap();
+        let later = start + Duration::from_millis(10);
+        send_to_sources(BcMedia::Aac(aac), &None, &aud_src, &mut state, later).unwrap();
+        send_to_sources(BcMedia::Adpcm(adpcm), &None, &aud_src, &mut state, later).unwrap();
+        let stamps = first(&seen, 3);
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        assert_eq!(stamps, [0, aac_duration, 2 * aac_duration]);
+    }
+
+    #[test]
+    fn a_client_that_plays_again_starts_from_zero() {
+        // Prepared, then reset, as between a client's DESCRIBE and PLAY
+        let (pipeline, src) = appsrc_pipeline(1024 * 1024);
+        let seen = timestamps(&src);
+        pipeline.set_state(gstreamer::State::Paused).unwrap();
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        let vid_src = Some(src);
+        let mut state = PumpState::default();
+        let start = Instant::now();
+        send_to_sources(frame(true, 16), &vid_src, &None, &mut state, start).unwrap();
+
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let later = start + Duration::from_secs(5);
+        send_to_sources(frame(true, 16), &vid_src, &None, &mut state, later).unwrap();
+        let stamps = first(&seen, 1);
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        assert_eq!(stamps, [0]);
     }
 
     #[test]
@@ -1329,7 +1506,7 @@ mod tests {
             &vid_src,
             &None,
             &mut state,
-            &stream_config(25),
+            Instant::now(),
         )
         .unwrap();
         for _ in 0..100 {
@@ -1338,7 +1515,7 @@ mod tests {
                 &vid_src,
                 &None,
                 &mut state,
-                &stream_config(25),
+                Instant::now(),
             )
             .unwrap();
         }
@@ -1360,25 +1537,11 @@ mod tests {
         pipeline.set_state(gstreamer::State::Null).unwrap();
         let vid_src = Some(src);
         let mut state = PumpState::default();
-        send_to_sources(
-            frame(true, 16),
-            &vid_src,
-            &None,
-            &mut state,
-            &stream_config(25),
-        )
-        .unwrap();
+        send_to_sources(frame(true, 16), &vid_src, &None, &mut state, Instant::now()).unwrap();
         assert!(state.need_keyframe, "the client missed that keyframe");
 
         pipeline.set_state(gstreamer::State::Playing).unwrap();
-        send_to_sources(
-            frame(true, 16),
-            &vid_src,
-            &None,
-            &mut state,
-            &stream_config(25),
-        )
-        .unwrap();
+        send_to_sources(frame(true, 16), &vid_src, &None, &mut state, Instant::now()).unwrap();
         pipeline.set_state(gstreamer::State::Null).unwrap();
         assert!(!state.need_keyframe);
     }
@@ -1392,7 +1555,6 @@ mod tests {
             element: pipeline.clone().upcast(),
             vid_src: Some(src),
             aud_src: None,
-            stream_config: stream_config(25),
             buffered: vec![],
             media_rx,
         };

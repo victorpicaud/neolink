@@ -64,8 +64,10 @@ pub struct Config {
     pub password: String,
     /// Highest encryption byte the fake camera will agree to.
     pub encryption: u16,
-    /// Advertised and simulated frame rate.
+    /// Simulated frame rate.
     pub fps: u8,
+    /// Advertised frame rate, which a real camera does not always keep to.
+    pub claimed_fps: u8,
     /// Advertised video width.
     pub width: u32,
     /// Advertised video height.
@@ -93,6 +95,10 @@ struct Opt {
     /// Frames per second to emit
     #[arg(long, default_value_t = 15)]
     fps: u8,
+    /// Frames per second to tell the client it gets, if not --fps. A camera
+    /// can send fewer than it says, in the dark for instance.
+    #[arg(long)]
+    claimed_fps: Option<u8>,
     /// Annex-B H.264 file to loop instead of the built-in test pattern
     #[arg(long)]
     h264: Option<PathBuf>,
@@ -134,6 +140,7 @@ async fn main() -> Result<()> {
         password: opt.password.clone(),
         encryption: opt.encryption.byte(),
         fps: opt.fps,
+        claimed_fps: opt.claimed_fps.unwrap_or(opt.fps),
         width: opt.width,
         height: opt.height,
     });

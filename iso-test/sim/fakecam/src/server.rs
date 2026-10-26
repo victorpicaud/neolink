@@ -317,7 +317,7 @@ impl Conn {
                         width: w,
                         height: h,
                     },
-                    default_framerate: self.cfg.fps as u32,
+                    default_framerate: self.cfg.claimed_fps as u32,
                     default_bitrate: 1024,
                     framerate_table: "25,22,20,18,16,15,12,10,8,6,4,2".to_string(),
                     bitrate_table: "1024,1536,2048,3072,4096".to_string(),
@@ -449,7 +449,7 @@ impl Conn {
         let info = BcMedia::InfoV2(BcMediaInfoV2 {
             video_width: self.cfg.width,
             video_height: self.cfg.height,
-            fps: self.cfg.fps,
+            fps: self.cfg.claimed_fps,
             start_year: 26,
             start_month: 1,
             start_day: 1,

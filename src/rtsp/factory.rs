@@ -491,15 +491,25 @@ fn build_unknown(bin: &Element, pattern: &str) -> Result<()> {
     source.set_property("num-buffers", 500i32); // Send buffers then EOS
     let queue = make_queue("queue0", 1024 * 1024 * 4)?;
 
-    let overlay = make_element("textoverlay", "overlay")?;
-    overlay.set_property("text", "Stream not Ready");
-    overlay.set_property_from_str("valignment", "top");
-    overlay.set_property_from_str("halignment", "left");
-    overlay.set_property("font-desc", "Sans, 16");
+    // The text needs the pango plugin, which not every install has. The
+    // pattern alone still tells the client that the stream exists.
+    let overlay = match make_element("textoverlay", "overlay") {
+        Ok(overlay) => {
+            overlay.set_property("text", "Stream not Ready");
+            overlay.set_property_from_str("valignment", "top");
+            overlay.set_property_from_str("halignment", "left");
+            overlay.set_property("font-desc", "Sans, 16");
+            Some(overlay)
+        }
+        Err(e) => {
+            log::debug!("Splash screen without text: {e:#}");
+            None
+        }
+    };
     let encoder = make_element("jpegenc", "encoder")?;
     let payload = make_element("rtpjpegpay", "pay0")?;
 
-    bin.add_many([&source, &queue, &overlay, &encoder, &payload])?;
+    bin.add_many([&source, &queue, &encoder, &payload])?;
     source.link_filtered(
         &queue,
         &Caps::builder("video/x-raw")
@@ -509,7 +519,13 @@ fn build_unknown(bin: &Element, pattern: &str) -> Result<()> {
             .field("framerate", gstreamer::Fraction::new(25, 1))
             .build(),
     )?;
-    Element::link_many([&queue, &overlay, &encoder, &payload])?;
+    if let Some(overlay) = overlay.as_ref() {
+        bin.add(overlay)?;
+        Element::link_many([&queue, overlay, &encoder])?;
+    } else {
+        queue.link(&encoder)?;
+    }
+    encoder.link(&payload)?;
 
     Ok(())
 }
@@ -905,6 +921,9 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "avdec_h264" => "libav (gst-libav)",
             "avdec_h265" => "libav (gst-libav)",
             "videotestsrc" => "videotestsrc (gst-plugins-base)",
+            "textoverlay" => "pango (gst-plugins-base)",
+            "jpegenc" => "jpeg (gst-plugins-good)",
+            "rtpjpegpay" => "rtp (gst-plugins-good)",
             "imagefreeze" => "imagefreeze (gst-plugins-good)",
             "audiotestsrc" => "audiotestsrc (gst-plugins-base)",
             "decodebin" => "playback (gst-plugins-good)",
@@ -1148,6 +1167,34 @@ mod tests {
         assert!(
             state.need_keyframe,
             "dropping video must wait for a keyframe"
+        );
+    }
+
+    #[test]
+    fn the_splash_screen_plays() {
+        gstreamer::init().unwrap();
+        let bin = gstreamer::Bin::new();
+        build_unknown(bin.upcast_ref(), "snow").unwrap();
+        let sink = make_element("fakesink", "sink").unwrap();
+        bin.add(&sink).unwrap();
+        bin.by_name("pay0").unwrap().link(&sink).unwrap();
+        let pipeline = gstreamer::Pipeline::new();
+        pipeline.add(&bin).unwrap();
+
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let message = pipeline.bus().unwrap().timed_pop_filtered(
+            ClockTime::from_seconds(10),
+            &[
+                gstreamer::MessageType::AsyncDone,
+                gstreamer::MessageType::Error,
+            ],
+        );
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+
+        let message = message.expect("the splash screen started within 10s");
+        assert!(
+            matches!(message.view(), gstreamer::MessageView::AsyncDone(_)),
+            "{message:?}"
         );
     }
 

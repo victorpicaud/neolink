@@ -253,7 +253,8 @@ local function xml_decrypt(ba, offset)
   local e = ByteArray.new()
   e:set_size(ba:len())
   for i=0,ba:len() - 1 do
-    e:set_index(i, bitops.bxor(bitops.band(offset, 0xFF), bitops.bxor(ba:get_index(i), key:byte(((i + offset) % 8) + 1))))
+    local key_byte = key:byte(((i + offset) % 8) + 1)
+    e:set_index(i, bitops.bxor(bitops.band(offset, 0xFF), bitops.bxor(ba:get_index(i), key_byte)))
   end
   return e
 end

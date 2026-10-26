@@ -11,11 +11,13 @@ publish = false
 anyhow = "1.0.71"
 clap = { version = "4.2.2", features = ["derive", "cargo"] }
 env_logger = "0.11"
-fcm-push-listener =  { version = "2.0.3" }
+fcm-push-listener = "4.1.2"
 log = { version = "0.4.17", features = [ "release_max_level_debug" ] }
 neolink_core = { path = "../core", version = "0.6.3-rc.3" }
 regex = "1.8.1"
+reqwest = "0.13"
 serde = "1.0.163"
 tokio = { version = "1.28.1", features = ["full"] }
+tokio-stream = "0.1"
 toml = "0.8.2"
 validator = { version = "0.21", features = ["derive"] }

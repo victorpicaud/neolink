@@ -4,7 +4,7 @@
 //!
 
 use anyhow::Context;
-use fcm_push_listener::*;
+use fcm_push_listener::{new_heartbeat_ack, Message, MessageStream, Registration};
 use std::collections::{HashMap, VecDeque};
 use std::{fs, path::PathBuf, sync::Arc};
 use tokio::{
@@ -27,6 +27,11 @@ const MAX_RECEIVED_IDS: usize = 1000;
 const MIN_RETRY: Duration = Duration::from_secs(3);
 /// Longest delay between registration attempts
 const MAX_RETRY: Duration = Duration::from_secs(60 * 60);
+/// Reolink's Android app, as Firebase knows it. Registering by sender ID
+/// alone, as before, is what Google stopped taking in June 2024.
+const FIREBASE_APP_ID: &str = "1:743639030586:android:86f60a4fb7143876";
+const FIREBASE_PROJECT_ID: &str = "reolink-login";
+const FIREBASE_API_KEY: &str = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
 
 /// What the cameras need to know to send us push notifications
 #[derive(Clone)]
@@ -164,9 +169,10 @@ impl PushNotiThread {
         let token_path = token_path();
         log::debug!("Push notification details are saved to {:?}", token_path);
         let mut retry = MIN_RETRY;
+        let http = reqwest::Client::new();
 
         loop {
-            let registration = match load_or_register(token_path.as_ref()).await {
+            let registration = match load_or_register(&http, token_path.as_ref()).await {
                 Ok(registration) => registration,
                 Err(e) => {
                     log::warn!(
@@ -202,22 +208,15 @@ impl PushNotiThread {
             log::debug!("Push notification Listening");
             let thread_pn_watcher = self.pn_watcher.clone();
             let failed = loop {
-                let mut listener = FcmPushListener::create(
-                    registration.clone(),
-                    |message: FcmMessage| {
-                        log::debug!("Got FCM Message: {:?}", message.payload_json);
-                        if let Some(id) = message.persistent_id.clone() {
-                            // Don't worry if queue is full we will just not register as received yet
-                            let _ = sender.try_send(PnRequest::AddPushID { id });
-                        }
-                        thread_pn_watcher.send_replace(Some(PushNoti {
-                            message: message.payload_json,
-                            id: message.persistent_id,
-                        }));
-                    },
-                    self.received_ids.read().await.iter().cloned().collect(),
+                let received_ids = self.received_ids.read().await.iter().cloned().collect();
+                let receiving = receive(
+                    &http,
+                    &registration,
+                    received_ids,
+                    sender,
+                    &thread_pn_watcher,
                 );
-                match timeout(Duration::from_secs(60 * 5), listener.connect()).await {
+                match timeout(Duration::from_secs(60 * 5), receiving).await {
                     Ok(Ok(_)) => {
                         log::debug!("Push notification listener reported normal shutdown");
                         break false;
@@ -225,10 +224,10 @@ impl PushNotiThread {
                     Ok(Err(e)) => {
                         use fcm_push_listener::Error::*;
                         match &e {
-                            MissingMessagePayload
-                            | MissingCryptoMetadata
-                            | ProtobufDecode(_)
-                            | Base64Decode(_) => {
+                            MissingCryptoMetadata(_)
+                            | ProtobufDecode(..)
+                            | Base64Decode(..)
+                            | Crypto(..) => {
                                 // Wipe data so next call is a new token
                                 if let Some(token_path) = token_path.as_ref() {
                                     let _ = fs::write(token_path, "");
@@ -278,8 +277,52 @@ fn token_path() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Receives push notifications until the connection ends
+async fn receive(
+    http: &reqwest::Client,
+    registration: &Registration,
+    received_ids: Vec<String>,
+    sender: &MpscSender<PnRequest>,
+    pn_watcher: &WatchSender<Option<PushNoti>>,
+) -> Result<(), fcm_push_listener::Error> {
+    use tokio::io::AsyncWriteExt;
+    use tokio_stream::StreamExt;
+
+    let session = registration.gcm.checkin(http).await?;
+    let connection = session.new_connection(received_ids).await?;
+    let mut messages = MessageStream::wrap(connection, &registration.keys);
+    while let Some(message) = messages.next().await {
+        match message? {
+            Message::Data(data) => {
+                let message = String::from_utf8_lossy(&data.body).into_owned();
+                log::debug!("Got FCM Message: {:?}", message);
+                if let Some(id) = data.persistent_id.clone() {
+                    // Don't worry if queue is full we will just not register as received yet
+                    let _ = sender.try_send(PnRequest::AddPushID { id });
+                }
+                pn_watcher.send_replace(Some(PushNoti {
+                    message,
+                    id: data.persistent_id,
+                }));
+            }
+            Message::HeartbeatPing => {
+                // Unanswered, they stop sending within the hour
+                messages
+                    .write_all(&new_heartbeat_ack())
+                    .await
+                    .map_err(fcm_push_listener::Error::Socket)?;
+            }
+            Message::Other(..) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Load the saved FCM registration, or register a new one and save it
-async fn load_or_register(token_path: Option<&PathBuf>) -> AnyResult<Registration> {
+async fn load_or_register(
+    http: &reqwest::Client,
+    token_path: Option<&PathBuf>,
+) -> AnyResult<Registration> {
     if let Some(Ok(Ok(registration))) = token_path.map(|token_path| {
         fs::read_to_string(token_path).map(|v| toml::from_str::<Registration>(&v))
     }) {
@@ -288,14 +331,14 @@ async fn load_or_register(token_path: Option<&PathBuf>) -> AnyResult<Registratio
     }
 
     log::debug!("Registering new push notification token");
-    let sender_id = "743639030586"; // andriod
-                                    // let sender_id = "696841269229"; // ios
-
-    // let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
-    // let firebase_project_id = "reolink-login";
-    // let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
-    // let vapid_key = "????";
-    let registration = fcm_push_listener::register(sender_id).await?;
+    let registration = fcm_push_listener::register(
+        http,
+        FIREBASE_APP_ID,
+        FIREBASE_PROJECT_ID,
+        FIREBASE_API_KEY,
+        None,
+    )
+    .await?;
     let new_token =
         toml::to_string(&registration).with_context(|| "Unable to serialise fcm token")?;
     if let Some(Err(e)) = token_path.map(|token_path| fs::write(token_path, &new_token)) {

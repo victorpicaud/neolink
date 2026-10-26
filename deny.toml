@@ -13,7 +13,7 @@ ignore = [
     # the gstreamer 0.23 bindings.
     { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro via gstreamer bindings" },
     # rustls-pemfile: unmaintained thin wrapper over rustls-pki-types, pulled
-    # in by rumqttc 0.25, mailin-embedded and reqwest 0.11.
+    # in by rumqttc 0.25 and mailin-embedded.
     { id = "RUSTSEC-2025-0134", reason = "unmaintained notice only; no known vulnerability" },
     # rustls-webpki 0.102.8: rumqttc 0.25.1 depends on it only for its error
     # type (src/tls.rs `WebPki(#[from] webpki::Error)`); certificate
@@ -23,15 +23,6 @@ ignore = [
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 only used for an error type by rumqttc" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 only used for an error type by rumqttc" },
     { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.102 only used for an error type by rumqttc" },
-    # fcm-push-listener 2.x (optional `pushnoti` feature) pulls in rustls 0.20,
-    # ring 0.16, h2 0.3 and webpki-roots 0.22. Google retired the API it uses;
-    # these go away when push notifications move to fcm-push-listener 4.x.
-    { id = "RUSTSEC-2024-0336", reason = "rustls 0.20 via fcm-push-listener 2.x (pushnoti feature)" },
-    { id = "RUSTSEC-2026-0349", reason = "rustls 0.20 via fcm-push-listener 2.x (pushnoti feature)" },
-    { id = "RUSTSEC-2025-0009", reason = "ring 0.16 via fcm-push-listener 2.x (pushnoti feature)" },
-    { id = "RUSTSEC-2025-0010", reason = "ring 0.16 via fcm-push-listener 2.x (pushnoti feature)" },
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via fcm-push-listener 2.x (pushnoti feature)" },
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.22 via fcm-push-listener 2.x (pushnoti feature)" },
 ]
 
 [licenses]
@@ -42,25 +33,16 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Mozilla's root certificates, as webpki-roots ships them
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MPL-2.0",
-    "OpenSSL",
     "Unicode-3.0",
+    # foldhash, and nanorand through flume
+    "Zlib",
 ]
 confidence-threshold = 0.8
-
-[[licenses.clarify]]
-crate = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
-
-# webpki 0.22 (via fcm-push-listener 2.x) ships an ISC LICENSE file but no
-# license field.
-[[licenses.clarify]]
-crate = "webpki"
-expression = "ISC"
-license-files = []
 
 [licenses.private]
 ignore = true

@@ -135,33 +135,9 @@ impl<'a> MqttBackend<'a> {
         let max_size = 100 * (1024 * 1024);
         mqttoptions.set_max_packet_size(max_size, max_size);
 
-        // Use TLS if ca path is set
-        if let Some(ca_path) = &self.config.ca {
-            if let Ok(ca) = std::fs::read(ca_path) {
-                // Use client_auth if they have cert and key
-                let client_auth = if let Some((cert_path, key_path)) = &self.config.client_auth {
-                    if let (Ok(cert_buf), Ok(key_buf)) =
-                        (std::fs::read(cert_path), std::fs::read(key_path))
-                    {
-                        Some((cert_buf, key_buf))
-                    } else {
-                        error!("Failed to set client tls");
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let transport = Transport::Tls(TlsConfiguration::Simple {
-                    ca,
-                    alpn: None,
-                    client_auth,
-                });
-                mqttoptions.set_transport(transport);
-            } else {
-                error!("Failed to set CA");
-            }
-        };
+        if let Some(transport) = tls_transport(self.config)? {
+            mqttoptions.set_transport(transport);
+        }
 
         if let Some((username, password)) = &self.config.credentials {
             mqttoptions.set_credentials(username, password);
@@ -537,6 +513,36 @@ enum MqttRequest {
     },
 }
 
+/// The TLS to connect with, if the config asks for it. A CA or client
+/// certificate that cannot be read is an error: the connection used to go
+/// ahead without encryption, and send the credentials in the clear.
+fn tls_transport(config: &MqttServerConfig) -> AnyResult<Option<Transport>> {
+    let Some(ca_path) = &config.ca else {
+        return Ok(None);
+    };
+    let ca = std::fs::read(ca_path)
+        .with_context(|| format!("Could not read the MQTT ca {}", ca_path.display()))?;
+    let client_auth = match &config.client_auth {
+        Some((cert_path, key_path)) => Some((
+            std::fs::read(cert_path).with_context(|| {
+                format!(
+                    "Could not read the MQTT client certificate {}",
+                    cert_path.display()
+                )
+            })?,
+            std::fs::read(key_path).with_context(|| {
+                format!("Could not read the MQTT client key {}", key_path.display())
+            })?,
+        )),
+        None => None,
+    };
+    Ok(Some(Transport::Tls(TlsConfiguration::Simple {
+        ca,
+        alpn: None,
+        client_auth,
+    })))
+}
+
 pub(crate) struct LastWillMqtt {
     cancel: CancellationToken,
 }
@@ -556,33 +562,9 @@ impl LastWillMqtt {
         let max_size = 100 * (1024 * 1024);
         mqttoptions.set_max_packet_size(max_size, max_size);
 
-        // Use TLS if ca path is set
-        if let Some(ca_path) = &config.ca {
-            if let Ok(ca) = std::fs::read(ca_path) {
-                // Use client_auth if they have cert and key
-                let client_auth = if let Some((cert_path, key_path)) = &config.client_auth {
-                    if let (Ok(cert_buf), Ok(key_buf)) =
-                        (std::fs::read(cert_path), std::fs::read(key_path))
-                    {
-                        Some((cert_buf, key_buf))
-                    } else {
-                        error!("Failed to set client tls");
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let transport = Transport::Tls(TlsConfiguration::Simple {
-                    ca,
-                    alpn: None,
-                    client_auth,
-                });
-                mqttoptions.set_transport(transport);
-            } else {
-                error!("Failed to set CA");
-            }
-        };
+        if let Some(transport) = tls_transport(config)? {
+            mqttoptions.set_transport(transport);
+        }
 
         if let Some((username, password)) = &config.credentials {
             mqttoptions.set_credentials(username, password);
@@ -661,6 +643,20 @@ mod tests {
             .await
             .expect("last-will loop kept running after cancel");
         assert!(result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_ca_that_cannot_be_read_is_an_error_not_a_connection_in_the_clear() {
+        let config: MqttServerConfig =
+            toml::from_str("broker_addr = \"broker\"\nport = 8883\nca = \"/nonexistent/ca.pem\"\n")
+                .unwrap();
+        let Err(error) = tls_transport(&config) else {
+            panic!("connected without the CA");
+        };
+        assert!(
+            format!("{error:#}").contains("Could not read the MQTT ca"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

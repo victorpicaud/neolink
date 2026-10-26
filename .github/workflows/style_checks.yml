@@ -105,6 +105,8 @@ jobs:
         run: bash iso-test/sim/camera-time.sh
       - name: End-to-end motion test (over MQTT)
         run: bash iso-test/sim/motion.sh
+      - name: End-to-end MQTT broker test
+        run: bash iso-test/sim/mqtt-broker.sh
 
   check_deny:
     needs: pre_job

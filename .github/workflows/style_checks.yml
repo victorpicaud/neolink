@@ -1,6 +1,9 @@
-name: Style
+name: Checks
 
 on: [push, pull_request]
+
+# The Rust toolchain (and its clippy/rustfmt components) is pinned by
+# rust-toolchain.toml; rustup installs it on first use.
 
 jobs:
   pre_job:
@@ -29,20 +32,16 @@ jobs:
           sudo apt update
           sudo apt install -y aptitude
           sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler
-      - name: Install nightly rust
-        run: |
-          rustup toolchain install nightly --component clippy
-          rustup override set nightly
-      - name: Run clippy manually
+      - name: Run clippy
         run: |
           echo "All Features"
-          cargo +nightly clippy --workspace --all-targets --all-features || exit 1
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
           echo "No Features"
-          cargo +nightly clippy --workspace --all-targets --no-default-features || exit 1
+          cargo clippy --workspace --all-targets --no-default-features -- -D warnings
           echo "Gstreamer Only"
-          cargo +nightly clippy --workspace --all-targets --no-default-features --features=gstreamer || exit 1
+          cargo clippy --workspace --all-targets --no-default-features --features=gstreamer -- -D warnings
           echo "Pushnoti Only"
-          cargo +nightly clippy --workspace --all-targets --no-default-features --features=pushnoti || exit 1
+          cargo clippy --workspace --all-targets --no-default-features --features=pushnoti -- -D warnings
 
   check_fmt:
     needs: pre_job
@@ -51,13 +50,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install nightly rust
-        run: |
-          rustup toolchain install nightly --component rustfmt
-          rustup override set nightly
       - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  test:
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt install gstreamer and deps
         run: |
-          cargo +nightly fmt --all -- --check
+          sudo apt update
+          sudo apt install -y --no-install-recommends \
+            libgstrtspserver-1.0-dev libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-libav \
+            protobuf-compiler libssl-dev
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
+      - name: Test (no default features)
+        run: cargo test --workspace --no-default-features
+
+  check_deny:
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny
+        run: cargo deny --workspace --all-features check
 
   check_lua:
     needs: pre_job

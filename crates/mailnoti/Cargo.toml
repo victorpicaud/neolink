@@ -2,6 +2,8 @@
 name = "mailnoti"
 version = "0.6.3-rc.3"
 edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
 
 
 [dependencies]

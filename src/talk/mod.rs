@@ -38,10 +38,16 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         .await
         .with_context(|| format!("Camera {} does not support talk", name))?;
 
-    if talk_ability.duplex_list.is_empty()
-        || talk_ability.audio_stream_mode_list.is_empty()
-        || talk_ability.audio_config_list.is_empty()
-    {
+    // Some cameras offer several modes; the first is what used to be the only one
+    let audio_stream_mode = talk_ability
+        .audio_stream_mode_list
+        .first()
+        .and_then(|modes| modes.audio_stream_mode.first())
+        .cloned();
+    let Some(audio_stream_mode) = audio_stream_mode else {
+        return Err(anyhow!("Camera {} does not support talk", name));
+    };
+    if talk_ability.duplex_list.is_empty() || talk_ability.audio_config_list.is_empty() {
         return Err(anyhow!("Camera {} does not support talk", name));
     }
 
@@ -52,9 +58,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
     let talk_config = TalkConfig {
         channel_id: config.channel_id,
         duplex: talk_ability.duplex_list[config_id].duplex.clone(),
-        audio_stream_mode: talk_ability.audio_stream_mode_list[config_id]
-            .audio_stream_mode
-            .clone(),
+        audio_stream_mode,
         audio_config: talk_ability.audio_config_list[config_id]
             .audio_config
             .clone(),

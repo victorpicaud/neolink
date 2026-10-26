@@ -5,6 +5,7 @@ use gstreamer::{
     MessageView, ParseFlags, Pipeline, ResourceError, State,
 };
 use gstreamer_app::{AppSink, AppSinkCallbacks};
+use std::path::Path;
 use tokio::{
     sync::mpsc::{channel, Receiver, Sender},
     task::JoinSet,
@@ -12,28 +13,36 @@ use tokio::{
 
 use byte_slice_cast::*;
 
+/// Where the sound comes from
+#[derive(Clone, Copy)]
+pub(super) enum Input<'a> {
+    /// A sound file
+    File(&'a Path),
+    /// A GStreamer source, such as a microphone: "alsasrc device=hw:1"
+    Source(&'a str),
+}
+
+/// Plays `input` into ADPCM as the camera wants it, which the receiver gets.
+/// The task ends with the sound, or with what stopped it.
 #[allow(clippy::type_complexity)]
 pub(super) fn from_input(
-    input_src: &str,
+    input: Input,
     volume: f32,
     block_align: u16,
     sample_rate: u16,
 ) -> Result<(JoinSet<AnyResult<()>>, Receiver<Vec<u8>>)> {
-    let pipeline = create_pipeline(input_src, volume, block_align, sample_rate)?;
-    input(pipeline)
+    let pipeline = create_pipeline(input, volume, block_align, sample_rate)?;
+    start(pipeline)
 }
 
 #[allow(clippy::type_complexity)]
-fn input(pipeline: Pipeline) -> Result<(JoinSet<AnyResult<()>>, Receiver<Vec<u8>>)> {
+fn start(pipeline: Pipeline) -> Result<(JoinSet<AnyResult<()>>, Receiver<Vec<u8>>)> {
     let appsink = get_sink(&pipeline)?;
     let (tx, rx) = channel(30);
     let mut set = JoinSet::<AnyResult<()>>::new();
     set_data_channel(&appsink, tx);
 
-    set.spawn_blocking(move || {
-        let _ = start_pipeline(pipeline);
-        AnyResult::Ok(())
-    });
+    set.spawn_blocking(move || start_pipeline(pipeline));
 
     Ok((set, rx))
 }
@@ -45,17 +54,15 @@ fn start_pipeline(pipeline: Pipeline) -> Result<()> {
         .bus()
         .expect("Pipeline without bus. Shouldn't happen!");
 
+    let mut result = Ok(());
     for msg in bus.iter_timed(ClockTime::NONE) {
         match msg.view() {
             MessageView::Eos(..) => break,
             MessageView::Error(err) => {
-                pipeline
-                    .set_state(State::Null)
-                    .context("Error in gstreamer when setting state to Null")?;
-                log::warn!(
-                    "Error from gstreamer when setting the play state {:?} setting to Null instead",
-                    err
-                );
+                // Nothing comes after an error, the end of the stream either:
+                // waiting for it hung talk for good (#318)
+                result = Err(anyhow!("{} ({:?})", err.error(), err.debug()));
+                break;
             }
             _ => (),
         }
@@ -65,7 +72,7 @@ fn start_pipeline(pipeline: Pipeline) -> Result<()> {
         .set_state(State::Null)
         .context("Error in gstreamer when setting state to Null")?;
 
-    Ok(())
+    result
 }
 
 fn get_sink(pipeline: &Pipeline) -> Result<AppSink> {
@@ -137,13 +144,20 @@ fn set_data_channel(appsink: &AppSink, tx: Sender<Vec<u8>>) {
 }
 
 fn create_pipeline(
-    source: &str,
+    input: Input,
     volume: f32,
     block_align: u16,
     sample_rate: u16,
 ) -> Result<Pipeline> {
     gstreamer::init()
         .context("Unable to start gstreamer ensure it and all plugins are installed")?;
+
+    let source = match input {
+        // Its location is set below. In the text of the pipeline, a path
+        // with a space or a quote in it broke the pipeline.
+        Input::File(_) => "filesrc name=thesource",
+        Input::Source(source) => source,
+    };
 
     let launch_str = format!(
         "{} \
@@ -168,6 +182,16 @@ fn create_pipeline(
     let pipeline = pipeline.dynamic_cast::<Pipeline>().map_err(|_| {
         anyhow!("Unable to create gstreamer pipeline ensure all gstramer plugins are installed")
     })?;
+
+    if let Input::File(path) = input {
+        let location = path
+            .to_str()
+            .ok_or_else(|| anyhow!("The file path {path:?} is not UTF-8"))?;
+        pipeline
+            .by_name("thesource")
+            .expect("There should be `thesource`")
+            .set_property("location", location);
+    }
 
     let appsink = get_sink(&pipeline)?;
 

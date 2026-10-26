@@ -6,6 +6,9 @@
 #   - the sound comes as fast as it plays, so that the camera never waits
 #     for more
 #   - talk stops once the sound has played
+#   - a file whose path has spaces in it plays
+#   - a file that is not sound ends talk with an error, at once
+#   - talk without a file or the microphone says it needs one
 # Needs ffmpeg and python3 on PATH.
 #
 # Usage: iso-test/sim/talk.sh [--release]
@@ -64,6 +67,35 @@ else
   else
     flunk "talk stopped after ${STOPPED}s, with ${SOUND}s of sound"
   fi
+fi
+
+cp "$WORK/tone.wav" "$WORK/a tone.wav"
+code=0
+timeout -k 2 60 "$NEOLINK_BIN" talk --config "$WORK/neolink.toml" -f "$WORK/a tone.wav" t \
+  > "$WORK/talk-spaces.log" 2>&1 || code=$?
+if [ "$code" = 0 ]; then
+  echo "ok: a file whose path has spaces in it plays"
+else
+  flunk "a file whose path has spaces in it ended talk with $code: $(tail -n 2 "$WORK/talk-spaces.log" | tr '\n' ' ')"
+fi
+
+echo "not a sound" > "$WORK/not-sound.wav"
+code=0
+timeout -k 2 30 "$NEOLINK_BIN" talk --config "$WORK/neolink.toml" -f "$WORK/not-sound.wav" t \
+  > "$WORK/talk-not-sound.log" 2>&1 || code=$?
+if [ "$code" = 1 ] && grep -q "Could not play the sound" "$WORK/talk-not-sound.log"; then
+  echo "ok: a file that is not sound ends talk with an error"
+else
+  flunk "a file that is not sound ended talk with $code: $(tail -n 2 "$WORK/talk-not-sound.log" | tr '\n' ' ')"
+fi
+
+code=0
+timeout -k 2 30 "$NEOLINK_BIN" talk --config "$WORK/neolink.toml" t \
+  > "$WORK/talk-nothing.log" 2>&1 || code=$?
+if [ "$code" = 2 ] && grep -q "required" "$WORK/talk-nothing.log"; then
+  echo "ok: talk without a file or the microphone says it needs one"
+else
+  flunk "talk without a file or the microphone ended with $code: $(tail -n 2 "$WORK/talk-nothing.log" | tr '\n' ' ')"
 fi
 
 finish

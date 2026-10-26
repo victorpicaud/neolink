@@ -76,25 +76,22 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         ));
     }
 
-    let (mut set, rx) = match (&opt.file_path, &opt.microphone) {
-        (Some(path), false) => gst::from_input(
-            &format!(
-                "filesrc location={}",
-                path.to_str().expect("File path not UTF8 complient")
-            ),
+    // The command line asks for one or the other
+    let (mut set, rx) = match &opt.file_path {
+        Some(path) => gst::from_input(gst::Input::File(path), opt.volume, block_size, sample_rate)
+            .with_context(|| format!("Failed to setup gst with the file: {:?}", path))?,
+        None => gst::from_input(
+            gst::Input::Source(&opt.input_src),
             opt.volume,
             block_size,
             sample_rate,
         )
-        .with_context(|| format!("Failed to setup gst with the file: {:?}", path))?,
-        (None, true) => gst::from_input(&opt.input_src, opt.volume, block_size, sample_rate)
-            .context("Failed to setup gst using the microphone")?,
-        _ => unreachable!(),
+        .context("Failed to setup gst using the microphone")?,
     };
 
     // Shared with each try of the task, should the camera reconnect
     let rx = Arc::new(Mutex::new(rx));
-    camera
+    let talked = camera
         .run_task(|cam| {
             let rx = rx.clone();
             let talk_config = talk_config.clone();
@@ -104,10 +101,17 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
             })
         })
         .await
-        .context("Talk stream ended early")?;
+        .context("Talk stream ended early");
 
+    // The pipeline ends once talk takes no more of its sound
     drop(rx);
-    while set.join_next().await.is_some() {}
-
-    Ok(())
+    let mut played = Ok(());
+    while let Some(ended) = set.join_next().await {
+        match ended {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => played = Err(e.context("Could not play the sound")),
+            Err(e) => played = Err(anyhow!(e).context("Could not play the sound")),
+        }
+    }
+    talked.and(played)
 }

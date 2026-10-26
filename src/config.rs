@@ -2,17 +2,18 @@ use crate::mqtt::Discoveries;
 #[cfg(feature = "gstreamer")]
 use neolink_core::bc_protocol::StreamKind;
 use neolink_core::bc_protocol::{DiscoveryMethods, PrintFormat};
-use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::clone::Clone;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use validator::Validate;
 use validator::ValidationError;
 
 static RE_TLS_CLIENT_AUTH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(none|request|require)$").unwrap());
-static RE_PAUSE_MODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(black|still|test|none)$").unwrap());
+static RE_PAUSE_MODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(black|still|test|none)$").unwrap());
 static RE_MAXENC_SRC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^([nN]one|[Aa][Ee][Ss]|[Bb][Cc][Ee][Nn][Cc][Rr][Yy][Pp][Tt])$").unwrap()
 });

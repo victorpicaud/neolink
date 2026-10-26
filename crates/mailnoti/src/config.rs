@@ -1,8 +1,8 @@
 use neolink_core::bc_protocol::DiscoveryMethods;
-use std::sync::LazyLock;
 use regex::Regex;
 use serde::Deserialize;
 use std::clone::Clone;
+use std::sync::LazyLock;
 use validator::{Validate, ValidationError};
 
 static RE_MAXENC_SRC: LazyLock<Regex> = LazyLock::new(|| {

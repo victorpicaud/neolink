@@ -83,13 +83,11 @@ impl UdpXml {
         // writer.write_event(quick_xml::events::Event::Decl(
         //     quick_xml::events::BytesDecl::new("1.0", Some("UTF-8"), None),
         // ))?;
-        writer
-            .create_element("P2P")
-            .write_inner_content(|writer| {
-                writer
-                    .write_serializable("", &self)
-                    .map_err(std::io::Error::other)
-            })?;
+        writer.create_element("P2P").write_inner_content(|writer| {
+            writer
+                .write_serializable("", &self)
+                .map_err(std::io::Error::other)
+        })?;
 
         Ok(w)
     }

@@ -147,7 +147,7 @@ impl PushNotiThread {
             log::debug!("Push notification Listening");
             let thread_pn_watcher = self.pn_watcher.clone();
 
-            for (_, instance) in self.registed_cameras.iter() {
+            for instance in self.registed_cameras.values() {
                 let uid = uid.clone();
                 let fcm_token = fcm_token.clone();
                 let instance = instance.clone();

@@ -1,5 +1,5 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
@@ -93,6 +93,23 @@ impl StreamConfig {
             vid_type: None,
             aud_type: None,
         })
+    }
+
+    /// Frame rate to assume when the camera did not report a usable one
+    const DEFAULT_FPS: u32 = 25;
+
+    /// The frame rate, never zero
+    fn effective_fps(&self) -> u32 {
+        if self.fps > 0 {
+            self.fps
+        } else {
+            Self::DEFAULT_FPS
+        }
+    }
+
+    /// Time between two video frames
+    fn frame_period(&self) -> Duration {
+        Duration::from_micros(1_000_000 / u64::from(self.effective_fps()))
     }
 
     fn update_fps(&mut self, fps: u32) {
@@ -243,19 +260,15 @@ pub(super) async fn make_factory(
                         // Run blocking code on a seperate thread
                         // This is not an async thread
                         std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
-                            let mut pools = Default::default();
+                            let mut state = PumpState::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
                                 send_to_sources(
                                     buffered,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
+                                    &mut state,
                                     &stream_config,
                                 )?;
                             }
@@ -264,11 +277,9 @@ pub(super) async fn make_factory(
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
                                     data,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
+                                    &mut state,
                                     &stream_config,
                                 );
                                 if let Err(r) = &r {
@@ -299,65 +310,104 @@ pub(super) async fn make_factory(
     Ok((factory, thread))
 }
 
+/// Per-client state of the frame pump
+#[derive(Default)]
+struct PumpState {
+    /// Timestamp of the next video buffer in microseconds. A u32 wrapped after
+    /// 71.6 minutes, and the jump back to zero froze the stream.
+    vid_ts: u64,
+    /// Timestamp of the next audio buffer in microseconds
+    aud_ts: u64,
+    /// Video was dropped, so P-frames are skipped until the next keyframe: a
+    /// decoder cannot use them without the frames they reference.
+    need_keyframe: bool,
+}
+
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
+    state: &mut PumpState,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
-    // Update TS
     match data {
         BcMedia::Aac(aac) => {
-            let duration = aac.duration().expect("Could not calculate AAC duration");
+            let Some(duration) = aac.duration() else {
+                log::debug!("Dropping AAC frame with an unreadable header");
+                return Ok(());
+            };
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                send_audio(aud_src, aac.data, state.aud_ts)?;
             }
-            *aud_ts += duration;
+            state.aud_ts += u64::from(duration);
         }
         BcMedia::Adpcm(adpcm) => {
-            let duration = adpcm
-                .duration()
-                .expect("Could not calculate ADPCM duration");
+            let Some(duration) = adpcm.duration() else {
+                log::debug!("Dropping ADPCM frame with an unreadable header");
+                return Ok(());
+            };
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                send_audio(aud_src, adpcm.data, state.aud_ts)?;
             }
-            *aud_ts += duration;
+            state.aud_ts += u64::from(duration);
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
-            if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
-            }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
+        BcMedia::Iframe(BcMediaIframe { data, .. }) => {
+            send_video(vid_src, data, true, state)?;
+            state.vid_ts += stream_config.frame_period().as_micros() as u64;
+        }
+        BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+            send_video(vid_src, data, false, state)?;
+            state.vid_ts += stream_config.frame_period().as_micros() as u64;
         }
         _ => {}
     }
     Ok(())
 }
 
-fn send_to_appsrc(
-    appsrc: &AppSrc,
+fn send_audio(aud_src: &AppSrc, data: Vec<u8>, ts: u64) -> AnyResult<()> {
+    if is_full(aud_src) {
+        log::trace!("Audio source is full, dropping a frame");
+        return Ok(());
+    }
+    log::trace!("Sending audio: {:?}", Duration::from_micros(ts));
+    send_to_appsrc(aud_src, data, Duration::from_micros(ts))
+}
+
+fn send_video(
+    vid_src: &Option<AppSrc>,
     data: Vec<u8>,
-    mut ts: Duration,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    keyframe: bool,
+    state: &mut PumpState,
 ) -> AnyResult<()> {
+    let Some(vid_src) = vid_src.as_ref() else {
+        return Ok(());
+    };
+    if state.need_keyframe && !keyframe {
+        log::trace!("Waiting for a keyframe, dropping a P-frame");
+        return Ok(());
+    }
+    if is_full(vid_src) {
+        log::trace!("Video source is full, dropping a frame");
+        state.need_keyframe = true;
+        return Ok(());
+    }
+    log::trace!("Sending video: {:?}", Duration::from_micros(state.vid_ts));
+    send_to_appsrc(vid_src, data, Duration::from_micros(state.vid_ts))?;
+    if keyframe {
+        state.need_keyframe = false;
+    }
+    Ok(())
+}
+
+/// The appsrcs are non-blocking, so they would queue without limit when the
+/// client falls behind. Frames are dropped instead once `max-bytes` is
+/// reached.
+fn is_full(appsrc: &AppSrc) -> bool {
+    let max = appsrc.max_bytes();
+    max > 0 && appsrc.current_level_bytes() >= max
+}
+
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -380,48 +430,23 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
-    let buf = {
-        let msg_size = data.len();
 
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
-
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
-            gst_buf_mut.set_dts(time);
-            gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
-        gst_buf
-    };
+    // Wrap the frame's own allocation: no copy, and it is freed as soon as the
+    // pipeline is done with it. (A pool per distinct frame size used to be
+    // kept here, which leaked memory and file descriptors without bound.)
+    let mut buf = gstreamer::Buffer::from_mut_slice(data);
+    {
+        let buf = buf
+            .get_mut()
+            .ok_or_else(|| anyhow!("New buffer is not writable"))?;
+        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        buf.set_dts(time);
+        buf.set_pts(time);
+    }
 
     // Push buffer into the appsrc
     match appsrc.push_buffer(buf) {
-        Ok(_) => {
-            // log::info!(
-            //     "Send {}{} on {}",
-            //     data.data.len(),
-            //     if data.keyframe { " (keyframe)" } else { "" },
-            //     appsrc.name()
-            // );
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(FlowError::Flushing) => {
             // Buffer is full just skip
             log::info!(
@@ -431,18 +456,7 @@ fn send_to_appsrc(
             Ok(())
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
-    }?;
-    // Check if we need to pause
-    if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Paused)
-    {
-        appsrc.set_state(gstreamer::State::Playing).unwrap();
-    } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Playing)
-    {
-        appsrc.set_state(gstreamer::State::Paused).unwrap();
     }
-    Ok(())
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
@@ -522,7 +536,7 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
 
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(stream_config.frame_period().as_nanos() as i64);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
@@ -573,7 +587,7 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(stream_config.frame_period().as_nanos() as i64);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
@@ -626,7 +640,7 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
 
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(stream_config.frame_period().as_nanos() as i64);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
@@ -712,7 +726,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(stream_config.frame_period().as_nanos() as i64);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
@@ -720,7 +734,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
 
     source.set_caps(Some(
         &Caps::builder("audio/x-adpcm")
-            .field("layout", "div")
+            .field("layout", "dvi")
             .field("block_align", block_size as i32)
             .field("channels", 1i32)
             .field("rate", 8000i32)
@@ -738,12 +752,18 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
 
     bin.add_many([&source, &queue, &decoder, &encoder])?;
     Element::link_many([&source, &queue, &decoder])?;
+    // This runs on a GStreamer thread: a panic here would abort the process
     decoder.connect_pad_added(move |_element, pad| {
-        let sink_pad = encoder
-            .static_pad("sink")
-            .expect("Encoder is missing its pad");
-        pad.link(&sink_pad)
-            .expect("Failed to link ADPCM decoder to encoder");
+        let Some(sink_pad) = encoder.static_pad("sink") else {
+            log::warn!("ADPCM encoder is missing its sink pad");
+            return;
+        };
+        if sink_pad.is_linked() {
+            return;
+        }
+        if let Err(e) = pad.link(&sink_pad) {
+            log::warn!("Failed to link ADPCM decoder to encoder: {e:?}");
+        }
     });
 
     let source = source
@@ -784,7 +804,7 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
 
     source.set_is_live(false);
     source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_min_latency(stream_config.frame_period().as_nanos() as i64);
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
@@ -958,6 +978,186 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 }
 
 fn buffer_size(bitrate: u32) -> u32 {
-    // 0.1 seconds (according to bitrate) or 4kb what ever is larger
-    std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+    // 2 seconds of data at the stream's bitrate, but at least 1 MiB so a few
+    // keyframes still fit when the camera did not report a bitrate
+    std::cmp::max(bitrate.saturating_mul(2) / 8, 1024 * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neolink_core::bcmedia::model::{BcMediaAac, BcMediaAdpcm, VideoType};
+
+    fn stream_config(fps: u32) -> StreamConfig {
+        StreamConfig {
+            resolution: [640, 360],
+            bitrate: 1_000_000,
+            fps,
+            bitrate_table: vec![],
+            fps_table: vec![],
+            vid_type: Some(VideoType::H264),
+            aud_type: None,
+        }
+    }
+
+    fn frame(keyframe: bool, len: usize) -> BcMedia {
+        if keyframe {
+            BcMedia::Iframe(BcMediaIframe {
+                video_type: VideoType::H264,
+                microseconds: 0,
+                time: None,
+                data: vec![0x5a; len],
+            })
+        } else {
+            BcMedia::Pframe(BcMediaPframe {
+                video_type: VideoType::H264,
+                microseconds: 0,
+                data: vec![0x5a; len],
+            })
+        }
+    }
+
+    /// `appsrc ! fakesink`, configured like the real video sources
+    fn appsrc_pipeline(max_bytes: u64) -> (gstreamer::Pipeline, AppSrc) {
+        gstreamer::init().unwrap();
+        let pipeline = gstreamer::Pipeline::new();
+        let src = make_element("appsrc", "src")
+            .unwrap()
+            .dynamic_cast::<AppSrc>()
+            .unwrap();
+        src.set_is_live(false);
+        src.set_block(false);
+        src.set_max_bytes(max_bytes);
+        src.set_stream_type(AppStreamType::Stream);
+        let sink = make_element("fakesink", "sink").unwrap();
+        sink.set_property("sync", false);
+        pipeline.add_many([src.upcast_ref(), &sink]).unwrap();
+        src.link(&sink).unwrap();
+        (pipeline, src)
+    }
+
+    /// Compressed frames are a different size almost every time. A buffer
+    /// pool used to be created per distinct size and kept for the client's
+    /// lifetime: about 71 MiB for these 2048 sizes, plus two file descriptors
+    /// per pool on GStreamer before 1.26 (#422).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn variable_frame_sizes_keep_memory_and_fds_bounded() {
+        let fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let rss = || {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+            pages * 4096
+        };
+        let (pipeline, src) = appsrc_pipeline(64 * 1024 * 1024);
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let (fds_before, rss_before) = (fds(), rss());
+
+        let src = Some(src);
+        let mut state = PumpState::default();
+        for i in 0..2048 {
+            let len = 257 + i * 31;
+            send_to_sources(
+                frame(false, len),
+                &src,
+                &None,
+                &mut state,
+                &stream_config(25),
+            )
+            .unwrap();
+        }
+        let (fds_after, rss_after) = (fds(), rss());
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+
+        assert!(
+            fds_after <= fds_before + 32,
+            "file descriptors grew from {fds_before} to {fds_after}"
+        );
+        let grown = rss_after.saturating_sub(rss_before);
+        assert!(
+            grown < 32 * 1024 * 1024,
+            "resident memory grew by {} MiB",
+            grown / (1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn timestamps_pass_the_u32_microsecond_boundary() {
+        let start = u64::from(u32::MAX - 100);
+        let mut state = PumpState {
+            vid_ts: start,
+            aud_ts: start,
+            need_keyframe: false,
+        };
+        send_to_sources(
+            frame(false, 16),
+            &None,
+            &None,
+            &mut state,
+            &stream_config(25),
+        )
+        .unwrap();
+        assert_eq!(state.vid_ts, start + 40_000);
+
+        let aac = BcMedia::Aac(BcMediaAac {
+            data: vec![0xff, 0xf1, 0x60, 0, 0, 0, 0, 0],
+        });
+        send_to_sources(aac, &None, &None, &mut state, &stream_config(25)).unwrap();
+        let adpcm = BcMedia::Adpcm(BcMediaAdpcm { data: vec![0; 260] });
+        send_to_sources(adpcm, &None, &None, &mut state, &stream_config(25)).unwrap();
+        assert!(state.aud_ts > u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn zero_fps_falls_back_instead_of_dividing_by_zero() {
+        let mut state = PumpState::default();
+        send_to_sources(frame(true, 16), &None, &None, &mut state, &stream_config(0)).unwrap();
+        assert_eq!(state.vid_ts, 40_000);
+    }
+
+    #[test]
+    fn a_stalled_client_bounds_the_queue_and_waits_for_a_keyframe() {
+        // PAUSED: the sink prerolls the first buffer and then nothing drains
+        let (pipeline, src) = appsrc_pipeline(2000);
+        pipeline.set_state(gstreamer::State::Paused).unwrap();
+
+        let vid_src = Some(src);
+        let mut state = PumpState::default();
+        send_to_sources(
+            frame(true, 600),
+            &vid_src,
+            &None,
+            &mut state,
+            &stream_config(25),
+        )
+        .unwrap();
+        for _ in 0..100 {
+            send_to_sources(
+                frame(false, 600),
+                &vid_src,
+                &None,
+                &mut state,
+                &stream_config(25),
+            )
+            .unwrap();
+        }
+        let level = vid_src.as_ref().unwrap().current_level_bytes();
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+
+        assert!(level <= 2000 + 600, "queue grew to {level} bytes");
+        assert!(
+            state.need_keyframe,
+            "dropping video must wait for a keyframe"
+        );
+    }
+
+    #[test]
+    fn adpcm_caps_use_the_dvi_layout() {
+        gstreamer::init().unwrap();
+        let bin = gstreamer::Bin::new().upcast::<Element>();
+        let linked = pipe_adpcm(&bin, 512, &stream_config(25)).unwrap();
+        let caps = linked.appsrc.caps().unwrap();
+        let layout = caps.structure(0).unwrap().get::<&str>("layout").unwrap();
+        assert_eq!(layout, "dvi");
+    }
 }

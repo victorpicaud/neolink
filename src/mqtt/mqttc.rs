@@ -18,9 +18,12 @@ use tokio::{
         oneshot::{channel as oneshot, Sender as OneshotSender},
         watch::Receiver as WatchReceiver,
     },
-    time::{sleep, Duration},
+    time::{sleep, Duration, Instant},
 };
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tokio_stream::{
+    wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
+    StreamExt,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -259,6 +262,7 @@ impl<'a> MqttBackend<'a> {
                                             name,
                                             incomming_rx: BroadcastStream::new(incomming_tx.subscribe()),
                                             outgoing_tx: outgoing_tx.clone(),
+                                            lag_warned_at: None,
                                         };
                                         let _ = reply.send(Ok(instance));
                                     },
@@ -349,7 +353,12 @@ pub(crate) struct MqttInstance {
     outgoing_tx: MpscSender<MqttRequest>,
     incomming_rx: BroadcastStream<MqttReply>,
     name: String,
+    /// When this reader last warned that it fell behind
+    lag_warned_at: Option<Instant>,
 }
+
+/// A reader that keeps falling behind warns at most this often
+const LAG_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 impl MqttInstance {
     pub(crate) fn get_name(&self) -> &str {
@@ -429,12 +438,33 @@ impl MqttInstance {
 
     pub(crate) async fn recv(&mut self) -> AnyResult<MqttReply> {
         Ok(loop {
-            let mut msg = self
-                .incomming_rx
-                .next()
-                .await
-                .ok_or(anyhow!("End of client data"))?
-                .with_context(|| "Client stream is too far behind")?;
+            let mut msg = match self.incomming_rx.next().await {
+                Some(Ok(msg)) => msg,
+                // A burst of messages, such as the retained ones sent on
+                // subscribing, can outrun a reader. Ending here used to stop
+                // the reader for good.
+                Some(Err(BroadcastStreamRecvError::Lagged(missed))) => {
+                    let reader = if self.name.is_empty() {
+                        "neolink"
+                    } else {
+                        &self.name
+                    };
+                    let message = format!(
+                        "{reader}: {missed} MQTT messages arrived too fast to be read, skipped them"
+                    );
+                    if self
+                        .lag_warned_at
+                        .is_some_and(|at| at.elapsed() < LAG_WARNING_INTERVAL)
+                    {
+                        debug!("{message}");
+                    } else {
+                        warn!("{message}");
+                        self.lag_warned_at = Some(Instant::now());
+                    }
+                    continue;
+                }
+                None => return Err(anyhow!("End of client data")),
+            };
             // log::debug!("Got MQTT: {msg:?}");
             // log::debug!("self.name: {:?}", self.name);
 
@@ -632,5 +662,27 @@ mod tests {
             .await
             .expect("last-will loop kept running after cancel");
         assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_fell_behind_skips_what_it_missed() -> AnyResult<()> {
+        let (incoming_tx, incoming_rx) = broadcast(4);
+        let mut instance = MqttInstance {
+            outgoing_tx: mpsc(1).0,
+            incomming_rx: BroadcastStream::new(incoming_rx),
+            name: "cam".to_string(),
+            lag_warned_at: None,
+        };
+        for i in 0..10 {
+            incoming_tx.send(MqttReply {
+                topic: format!("cam/topic{i}"),
+                message: Arc::new(String::new()),
+            })?;
+        }
+
+        // The first six were overwritten before they were read
+        assert_eq!(instance.recv().await?.topic, "topic6");
+        assert_eq!(instance.recv().await?.topic, "topic7");
+        Ok(())
     }
 }

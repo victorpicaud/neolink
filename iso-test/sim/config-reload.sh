@@ -20,38 +20,19 @@ start_mosquitto "$MQTT_PORT"
 start_fakecam a 19200 19210
 start_fakecam b 19201 19211
 
-# config [--no-mqtt] CAMERA...: a config serving these cameras
-config() {
-  local mqtt=yes camera
-  if [ "$1" = --no-mqtt ]; then
-    mqtt=no
-    shift
-  fi
-  echo 'bind = "127.0.0.1"'
-  echo "bind_port = $RTSP_PORT"
-  if [ "$mqtt" = yes ]; then
-    printf '\n[mqtt]\nbroker_addr = "127.0.0.1"\nport = %s\n' "$MQTT_PORT"
-  fi
-  for camera in "$@"; do
-    case $camera in
-      a) camera_toml a 19200 ;;
-      b) camera_toml b 19201 ;;
-    esac
-  done
-}
-
-# publish_config CAMERA...: sends neolink a new config over MQTT
+# publish_config NAME=BC_PORT...: sends neolink a new config over MQTT
 publish_config() {
-  config "$@" | mosquitto_pub -h 127.0.0.1 -p "$MQTT_PORT" -t neolink/config -s
+  neolink_toml "$RTSP_PORT" "$MQTT_PORT" "$@" \
+    | mosquitto_pub -h 127.0.0.1 -p "$MQTT_PORT" -t neolink/config -s
 }
 
-config a b > "$WORK/neolink.toml"
+neolink_toml "$RTSP_PORT" "$MQTT_PORT" a=19200 b=19201 > "$WORK/neolink.toml"
 start_neolink "$WORK/neolink.toml" mqtt-rtsp
 wait_for_codec "$URL/a/main" h264
 wait_for_codec "$URL/b/main" h264
 b_connections=$(grep -c "b: Connecting to camera" "$WORK/neolink.log")
 
-publish_config b
+publish_config b=19201
 if wait_for_answer "$URL/a/main" "404 Not Found" 30; then
   echo "ok: a camera removed from the config is no longer served"
 else
@@ -63,7 +44,7 @@ else
   flunk "the other camera stopped streaming: $out"
 fi
 
-publish_config a b
+publish_config a=19200 b=19201
 if wait_for_answer "$URL/a/main" "^h264$" 60; then
   echo "ok: a camera added back is served again"
 else
@@ -76,7 +57,7 @@ else
 fi
 
 # On a port of its own, so that only the missing section can stop it
-RTSP_PORT=$((RTSP_PORT + 100)) config --no-mqtt a > "$WORK/no-mqtt.toml"
+neolink_toml $((RTSP_PORT + 100)) none a=19200 > "$WORK/no-mqtt.toml"
 for command in mqtt mqtt-rtsp; do
   start=$SECONDS
   rc=0

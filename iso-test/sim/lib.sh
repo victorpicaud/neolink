@@ -102,6 +102,21 @@ EOF
   done
 }
 
+# neolink_toml RTSP_PORT MQTT_PORT [NAME=BC_PORT...]: a config serving these
+# fakecams over RTSP, and over MQTT unless MQTT_PORT is "none"
+neolink_toml() {
+  local rtsp_port=$1 mqtt_port=$2 camera
+  shift 2
+  echo 'bind = "127.0.0.1"'
+  echo "bind_port = $rtsp_port"
+  if [ "$mqtt_port" != none ]; then
+    printf '\n[mqtt]\nbroker_addr = "127.0.0.1"\nport = %s\n' "$mqtt_port"
+  fi
+  for camera in "$@"; do
+    camera_toml "${camera%=*}" "${camera#*=}"
+  done
+}
+
 # probe URL SECONDS: prints the codecs of the streams at URL, or ffprobe's
 # error; fails if ffprobe does
 probe() {

@@ -25,14 +25,17 @@ use tokio::sync::{mpsc, watch, Mutex};
 
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Shared runtime state: the fault-injection mode and a "kill epoch" that is
-/// bumped to drop every live connection.
+/// Shared runtime state: the fault-injection mode, a "kill epoch" that is
+/// bumped to drop every live connection, and whether the camera sees motion.
 #[derive(Clone)]
 pub struct Shared {
     /// Current fault-injection mode.
     pub mode: watch::Sender<Mode>,
     /// Incremented by the `die` command; connections watching it hang up.
     pub kill: watch::Sender<u64>,
+    /// Set by the `motion` command and cleared by `still`. Every client that
+    /// asked for motion alarms is told of each change.
+    pub motion: watch::Sender<bool>,
 }
 
 impl Shared {
@@ -41,6 +44,7 @@ impl Shared {
         Self {
             mode: watch::Sender::new(mode),
             kill: watch::Sender::new(0),
+            motion: watch::Sender::new(false),
         }
     }
 }
@@ -74,6 +78,12 @@ struct Conn {
     video: HashMap<u16, tokio::task::JoinHandle<()>>,
     mode: watch::Receiver<Mode>,
     frames: Arc<Vec<AccessUnit>>,
+    /// Whether the client asked for motion alarms
+    motion_requested: bool,
+    motion: watch::Receiver<bool>,
+    /// The msg_num of the last motion alarm. A camera numbers the messages it
+    /// sends of its own accord itself.
+    motion_num: u16,
 }
 
 impl Conn {
@@ -355,7 +365,15 @@ impl Conn {
                 .await
             }
             (MSG_ID_SET_GENERAL, _) => self.ack(&meta).await,
-            (MSG_ID_MOTION_REQUEST, _) => self.ack(&meta).await,
+            (MSG_ID_MOTION_REQUEST, _) => {
+                self.ack(&meta).await?;
+                self.motion_requested = true;
+                let moving = *self.motion.borrow();
+                if moving {
+                    self.send_motion(moving).await?;
+                }
+                Ok(())
+            }
             // ---- Video
             (MSG_ID_VIDEO, _) => {
                 if !self.logged_in {
@@ -381,6 +399,36 @@ impl Conn {
                 self.nack(&meta).await
             }
         }
+    }
+
+    /// A motion alarm, as a camera sends once asked for them
+    async fn send_motion(&mut self, moving: bool) -> Result<()> {
+        let status = if moving { "MD" } else { "none" };
+        info!("motion: {status}");
+        self.motion_num = self.motion_num.wrapping_add(1);
+        let meta = BcMeta {
+            msg_id: MSG_ID_MOTION,
+            channel_id: 0,
+            stream_type: 0,
+            msg_num: self.motion_num,
+            response_code: 200,
+            class: 0x0000,
+        };
+        let xml = BcXml {
+            alarm_event_list: Some(AlarmEventList {
+                version: "1.1".to_string(),
+                alarm_events: vec![AlarmEvent {
+                    version: "1.1".to_string(),
+                    channel_id: 0,
+                    status: status.to_string(),
+                    ai_type: None,
+                    recording: 0,
+                    timeStamp: 0,
+                }],
+            }),
+            ..Default::default()
+        };
+        self.reply(Bc::new_from_xml(meta, xml)).await
     }
 
     /// Reply 200 with a BcMedia InfoV2 header, then pump frames forever.
@@ -545,6 +593,7 @@ pub async fn serve(
     let mut kill = shared.kill.subscribe();
     let kill_epoch = *kill.borrow_and_update();
     let mode = shared.mode.subscribe();
+    let mut motion = shared.motion.subscribe();
 
     let mut conn = Conn {
         cfg,
@@ -555,6 +604,9 @@ pub async fn serve(
         video: HashMap::new(),
         mode,
         frames,
+        motion_requested: false,
+        motion: motion.clone(),
+        motion_num: 0,
     };
 
     let mut buf = BytesMut::with_capacity(16 * 1024);
@@ -564,6 +616,14 @@ pub async fn serve(
                 if *kill.borrow() != kill_epoch {
                     info!("die: dropping connection {peer:?}");
                     break Ok(());
+                }
+            }
+            Ok(()) = motion.changed() => {
+                let moving = *motion.borrow_and_update();
+                if conn.motion_requested {
+                    if let Err(e) = conn.send_motion(moving).await {
+                        break Err(e);
+                    }
                 }
             }
             read = reader.read_buf(&mut buf) => {

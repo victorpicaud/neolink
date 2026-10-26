@@ -120,7 +120,7 @@ neolink_toml() {
 # probe URL SECONDS: prints the codecs of the streams at URL, or ffprobe's
 # error; fails if ffprobe does
 probe() {
-  timeout "$2" ffprobe -v error -rtsp_transport tcp \
+  timeout -k 2 "$2" ffprobe -v error -rtsp_transport tcp \
     -show_entries stream=codec_name -of csv=p=0 "$1" 2>&1
 }
 

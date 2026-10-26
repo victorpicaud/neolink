@@ -3,10 +3,10 @@
 
 Usage: ctl.py [host:port] <command> [<command> ...]
 
-Commands are normal, freeze, hang, die and status. Several may be given, in
-which case they are sent in order; prefix one with a number and a comma to
-delay it, e.g. `10,freeze` waits ten seconds first. That is enough to script
-a whole scenario without a supervisor:
+Commands are normal, freeze, hang, die, motion, still and status. Several may
+be given, in which case they are sent in order; prefix one with a number and
+a comma to delay it, e.g. `10,freeze` waits ten seconds first. That is enough
+to script a whole scenario without a supervisor:
 
     ctl.py 127.0.0.1:9010 5,freeze 20,normal
 """

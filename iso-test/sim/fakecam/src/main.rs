@@ -194,7 +194,7 @@ async fn control_session(stream: TcpStream, shared: Shared) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     writer
-        .write_all(b"fakecam control: normal|freeze|hang|die|status|quit\n")
+        .write_all(b"fakecam control: normal|freeze|hang|die|motion|still|status|quit\n")
         .await?;
     while let Some(line) = lines.next_line().await? {
         let reply = match line.trim().to_ascii_lowercase().as_str() {
@@ -222,6 +222,16 @@ async fn control_session(stream: TcpStream, shared: Shared) -> Result<()> {
                 shared.kill.send_replace(epoch);
                 info!("control: die (kill epoch {epoch})");
                 "ok die\n".to_string()
+            }
+            "motion" => {
+                shared.motion.send_replace(true);
+                info!("control: motion");
+                "ok motion\n".to_string()
+            }
+            "still" => {
+                shared.motion.send_replace(false);
+                info!("control: still");
+                "ok still\n".to_string()
             }
             "status" => format!("mode {:?}\n", *shared.mode.borrow()),
             "quit" => {

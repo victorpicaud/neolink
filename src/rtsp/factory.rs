@@ -17,6 +17,7 @@ use neolink_core::{
 use tokio::{
     sync::mpsc::{channel as mpsc, error::TrySendError, Receiver as MpscReceiver},
     task::JoinHandle,
+    time::{interval, Instant, MissedTickBehavior},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -405,38 +406,84 @@ async fn prepare_client(
     })
 }
 
+/// How often a client's pump checks that the client is still there while no
+/// frames come. It used to wait for the next frame to notice, and a paused
+/// stream sends none: the pump, its thread and the camera stream it held
+/// stayed behind for every client that left meanwhile.
+const LIVENESS_CHECK: Duration = Duration::from_secs(1);
+/// How long a client may look gone before its pump stops: GStreamer adds the
+/// pipeline to the client's media only after the pump has started
+const GONE_GRACE: Duration = Duration::from_secs(3);
+
 impl ClientPipeline {
-    /// Sends the camera's frames into the pipeline
+    /// Sends the camera's frames into the pipeline until the client is gone,
+    /// which lets go of the camera stream
     fn start_pump(self, name: String, stream: StreamKind) {
+        tokio::task::spawn(self.pump(name, stream));
+    }
+
+    async fn pump(self, name: String, stream: StreamKind) {
         let ClientPipeline {
+            element,
             vid_src,
             aud_src,
             stream_config,
             buffered,
             mut media_rx,
-            ..
         } = self;
-        // Run blocking code on a seperate thread
-        // This is not an async thread
-        std::thread::spawn(move || {
-            let mut state = PumpState::default();
-
-            log::trace!("{name}::{stream}: Sending buffered frames");
-            for buffered in buffered {
-                send_to_sources(buffered, &vid_src, &aud_src, &mut state, &stream_config)?;
-            }
-
-            log::trace!("{name}::{stream}: Sending new frames");
-            while let Some(data) = media_rx.blocking_recv() {
-                let r = send_to_sources(data, &vid_src, &aud_src, &mut state, &stream_config);
-                if let Err(r) = &r {
-                    log::info!("Failed to send to source: {r:?}");
+        // GStreamer holds the pipeline while the client is there. Holding it
+        // here too would keep the client looking connected after it left.
+        drop(element);
+        if vid_src.is_none() && aud_src.is_none() {
+            // The splash screen: nothing to send it
+            return;
+        }
+        let mut state = PumpState {
+            // A decoder can only start at a keyframe (#427)
+            need_keyframe: true,
+            ..Default::default()
+        };
+        let mut liveness = interval(LIVENESS_CHECK);
+        liveness.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut gone_since = None;
+        let mut buffered = buffered.into_iter();
+        loop {
+            let frame = match buffered.next() {
+                Some(frame) => Some(frame),
+                None => tokio::select! {
+                    frame = media_rx.recv() => match frame {
+                        Some(frame) => Some(frame),
+                        None => {
+                            log::debug!("{name}::{stream}: The camera stream ended");
+                            // So that the client knows, and can start again
+                            for app in vid_src.iter().chain(aud_src.iter()) {
+                                let _ = app.end_of_stream();
+                            }
+                            return;
+                        }
+                    },
+                    _ = liveness.tick() => None,
+                },
+            };
+            if let Some(frame) = frame {
+                if let Err(e) =
+                    send_to_sources(frame, &vid_src, &aud_src, &mut state, &stream_config)
+                {
+                    log::warn!("{name}::{stream}: Could not stream to a client: {e:#}");
+                    return;
                 }
-                r?;
             }
-            log::trace!("All media recieved");
-            AnyResult::Ok(())
-        });
+            let connected = vid_src
+                .iter()
+                .chain(aud_src.iter())
+                .all(|app| check_live(app).is_ok());
+            if connected {
+                gone_since = None;
+            } else if gone_since.get_or_insert_with(Instant::now).elapsed() >= GONE_GRACE {
+                log::debug!("{name}::{stream}: A client left");
+                return;
+            }
+        }
     }
 }
 
@@ -451,6 +498,9 @@ struct PumpState {
     /// Video was dropped, so P-frames are skipped until the next keyframe: a
     /// decoder cannot use them without the frames they reference.
     need_keyframe: bool,
+    /// The video source refused the last frame, as it does until the client
+    /// plays
+    refused: bool,
 }
 
 fn send_to_sources(
@@ -500,7 +550,8 @@ fn send_audio(aud_src: &AppSrc, data: Vec<u8>, ts: u64) -> AnyResult<()> {
         return Ok(());
     }
     log::trace!("Sending audio: {:?}", Duration::from_micros(ts));
-    send_to_appsrc(aud_src, data, Duration::from_micros(ts))
+    send_to_appsrc(aud_src, data, Duration::from_micros(ts))?;
+    Ok(())
 }
 
 fn send_video(
@@ -522,9 +573,21 @@ fn send_video(
         return Ok(());
     }
     log::trace!("Sending video: {:?}", Duration::from_micros(state.vid_ts));
-    send_to_appsrc(vid_src, data, Duration::from_micros(state.vid_ts))?;
-    if keyframe {
-        state.need_keyframe = false;
+    if send_to_appsrc(vid_src, data, Duration::from_micros(state.vid_ts))? {
+        state.refused = false;
+        if keyframe {
+            state.need_keyframe = false;
+        }
+    } else {
+        // The client will play from a later keyframe
+        state.need_keyframe = true;
+        if !state.refused {
+            state.refused = true;
+            log::debug!(
+                "{}: The client is not playing, dropping video until it does",
+                vid_src.name()
+            );
+        }
     }
     Ok(())
 }
@@ -537,9 +600,9 @@ fn is_full(appsrc: &AppSrc) -> bool {
     max > 0 && appsrc.current_level_bytes() >= max
 }
 
-fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
-    check_live(appsrc)?; // Stop if appsrc is dropped
-
+/// Pushes a frame. Returns false if the source refused it, as it does until
+/// the client plays.
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<bool> {
     // In live mode we follow the advice in
     // https://gstreamer.freedesktop.org/documentation/additional/design/element-source.html?gi-language=c#live-sources
     // Only push buffers when in play state and have a clock
@@ -553,11 +616,11 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
                 ts = Duration::from_micros(time.useconds());
             } else {
                 // Not playing
-                return Ok(());
+                return Ok(false);
             }
         } else {
             // Clock not up yet
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -576,15 +639,10 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
 
     // Push buffer into the appsrc
     match appsrc.push_buffer(buf) {
-        Ok(_) => Ok(()),
-        Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
-                appsrc.name()
-            );
-            Ok(())
-        }
+        Ok(_) => Ok(true),
+        // Not playing: between a client's DESCRIBE and PLAY the media is
+        // reset. This was logged as "Buffer full", for every frame (#349).
+        Err(FlowError::Flushing) => Ok(false),
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
     }
 }
@@ -1230,7 +1288,7 @@ mod tests {
         let mut state = PumpState {
             vid_ts: start,
             aud_ts: start,
-            need_keyframe: false,
+            ..Default::default()
         };
         send_to_sources(
             frame(false, 16),
@@ -1291,6 +1349,93 @@ mod tests {
         assert!(
             state.need_keyframe,
             "dropping video must wait for a keyframe"
+        );
+    }
+
+    #[test]
+    fn a_client_that_is_not_playing_yet_starts_at_a_later_keyframe() {
+        // Prepared, then reset, as between a client's DESCRIBE and PLAY
+        let (pipeline, src) = appsrc_pipeline(1024 * 1024);
+        pipeline.set_state(gstreamer::State::Paused).unwrap();
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        let vid_src = Some(src);
+        let mut state = PumpState::default();
+        send_to_sources(
+            frame(true, 16),
+            &vid_src,
+            &None,
+            &mut state,
+            &stream_config(25),
+        )
+        .unwrap();
+        assert!(state.need_keyframe, "the client missed that keyframe");
+
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        send_to_sources(
+            frame(true, 16),
+            &vid_src,
+            &None,
+            &mut state,
+            &stream_config(25),
+        )
+        .unwrap();
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        assert!(!state.need_keyframe);
+    }
+
+    fn client(
+        pipeline: &gstreamer::Pipeline,
+        src: AppSrc,
+    ) -> (ClientPipeline, tokio::sync::mpsc::Sender<BcMedia>) {
+        let (media_tx, media_rx) = mpsc(10);
+        let client = ClientPipeline {
+            element: pipeline.clone().upcast(),
+            vid_src: Some(src),
+            aud_src: None,
+            stream_config: stream_config(25),
+            buffered: vec![],
+            media_rx,
+        };
+        (client, media_tx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_left_is_let_go_while_no_frames_come() {
+        let (pipeline, src) = appsrc_pipeline(1024 * 1024);
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let (client, media_tx) = client(&pipeline, src);
+        let pump = tokio::spawn(client.pump("cam".to_string(), StreamKind::Main));
+        tokio::time::sleep(GONE_GRACE * 3).await;
+        assert!(!pump.is_finished(), "the client is still there");
+
+        // The client goes while the stream is paused
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        drop(pipeline);
+        tokio::time::timeout(GONE_GRACE * 3, pump)
+            .await
+            .expect("the pump stops once its client is gone")
+            .unwrap();
+        assert!(media_tx.is_closed(), "and lets go of the camera stream");
+    }
+
+    #[tokio::test]
+    async fn a_client_whose_camera_stream_ended_is_told() {
+        let (pipeline, src) = appsrc_pipeline(1024 * 1024);
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let (client, media_tx) = client(&pipeline, src.clone());
+        let pump = tokio::spawn(client.pump("cam".to_string(), StreamKind::Main));
+
+        drop(media_tx);
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("the pump stops with the camera stream")
+            .unwrap();
+        let after = src.push_buffer(gstreamer::Buffer::new());
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        assert_eq!(
+            after,
+            Err(FlowError::Eos),
+            "the client got an end of stream"
         );
     }
 

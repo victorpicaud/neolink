@@ -13,7 +13,6 @@ use futures::{
     sink::SinkExt,
     stream::{FuturesUnordered, Stream, StreamExt},
 };
-use lazy_static::lazy_static;
 use log::*;
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use std::collections::{btree_map::Entry, BTreeMap, HashSet};
@@ -59,36 +58,33 @@ struct UidLookupResults {
 }
 
 const MTU: u32 = 1350;
-lazy_static! {
-    static ref P2P_RELAY_HOSTNAMES: [&'static str; 12] = [
-        "p2p.reolink.com",
-        "p2p1.reolink.com",
-        "p2p2.reolink.com",
-        "p2p3.reolink.com",
-        "p2p4.reolink.com",
-        "p2p5.reolink.com",
-        "p2p6.reolink.com",
-        "p2p7.reolink.com",
-        "p2p8.reolink.com",
-        "p2p9.reolink.com",
-        "p2p10.reolink.com",
-        "p2p11.reolink.com",
-        // These following are all currently set to 127.0.0.1
-        // probably reserved for future use
-        // "p2p12.reolink.com",
-        // "p2p13.reolink.com",
-        // "p2p14.reolink.com",
-        // "p2p15.reolink.com",
-        // "p2p16.reolink.com",
-    ];
-    /// Maximum wait for a reply
-    static ref MAXIMUM_WAIT: Duration = Duration::from_secs(15);
-    /// Wait for tcp connections
-    static ref TCP_WAIT: Duration = Duration::from_secs(4);
-    /// How long to wait before resending
-    static ref RESEND_WAIT: Duration = Duration::from_millis(500);
-
-}
+const P2P_RELAY_HOSTNAMES: [&str; 12] = [
+    "p2p.reolink.com",
+    "p2p1.reolink.com",
+    "p2p2.reolink.com",
+    "p2p3.reolink.com",
+    "p2p4.reolink.com",
+    "p2p5.reolink.com",
+    "p2p6.reolink.com",
+    "p2p7.reolink.com",
+    "p2p8.reolink.com",
+    "p2p9.reolink.com",
+    "p2p10.reolink.com",
+    "p2p11.reolink.com",
+    // These following are all currently set to 127.0.0.1
+    // probably reserved for future use
+    // "p2p12.reolink.com",
+    // "p2p13.reolink.com",
+    // "p2p14.reolink.com",
+    // "p2p15.reolink.com",
+    // "p2p16.reolink.com",
+];
+/// Maximum wait for a reply
+const MAXIMUM_WAIT: Duration = Duration::from_secs(15);
+/// Wait for tcp connections
+const TCP_WAIT: Duration = Duration::from_secs(4);
+/// How long to wait before resending
+const RESEND_WAIT: Duration = Duration::from_millis(500);
 
 type Subscriber = Arc<RwLock<BTreeMap<u32, Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
 type Handlers = Arc<RwLock<Vec<Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
@@ -256,7 +252,7 @@ impl Discoverer {
                     }
                 }
             } => v,
-            _ = tokio::time::sleep(*MAXIMUM_WAIT) => Err::<T, Error>(Error::DiscoveryTimeout),
+            _ = tokio::time::sleep(MAXIMUM_WAIT) => Err::<T, Error>(Error::DiscoveryTimeout),
         }
     }
 
@@ -287,7 +283,7 @@ impl Discoverer {
         let mut reply = ReceiverStream::new(self.subscribe(target_tid).await?);
         let msg = BcUdp::Discovery(disc);
 
-        let mut inter = interval(*RESEND_WAIT);
+        let mut inter = interval(RESEND_WAIT);
         inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         let result = tokio::select! {
@@ -313,7 +309,7 @@ impl Discoverer {
             } => {Err::<T, Error>(v)},
             _ = {
                 // Sleep then emit Timeout
-                tokio::time::sleep(*MAXIMUM_WAIT)
+                tokio::time::sleep(MAXIMUM_WAIT)
             } => {
                 Err::<T, Error>(Error::DiscoveryTimeout)
             }
@@ -328,7 +324,7 @@ impl Discoverer {
             let target_tid = generate_tid();
             disc.tid = target_tid;
         }
-        let mut inter = interval(*RESEND_WAIT);
+        let mut inter = interval(RESEND_WAIT);
         inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let msg = BcUdp::Discovery(disc);
 
@@ -419,7 +415,7 @@ impl Discoverer {
             }
             addrs
         });
-        let mut addrs = timeout(*MAXIMUM_WAIT, task).await??;
+        let mut addrs = timeout(MAXIMUM_WAIT, task).await??;
         trace!("Uid lookup to: {:?}", addrs);
 
         Ok(addrs
@@ -1080,7 +1076,7 @@ impl Discovery {
         let username = "admin";
         let password = Some("123456");
         let mut tcp_source =
-            timeout(*TCP_WAIT, TcpSource::new(addr, username, password, false)).await??;
+            timeout(TCP_WAIT, TcpSource::new(addr, username, password, false)).await??;
 
         let md5_username = md5_string(username, Md5Trunc::ZeroLast);
         let md5_password = password
@@ -1104,7 +1100,7 @@ impl Discovery {
             })
             .await?;
 
-        let _bc: Bc = timeout(*TCP_WAIT, tcp_source.next())
+        let _bc: Bc = timeout(TCP_WAIT, tcp_source.next())
             .await?
             .ok_or(Error::CannotInitCamera)??; // Successful recv should mean a Bc packet if not then deser will fail
         Ok(())
@@ -1231,17 +1227,17 @@ impl Discovery {
 }
 
 fn get_local_ip() -> Result<std::net::IpAddr> {
-    get_if_addrs::get_if_addrs()?
+    if_addrs::get_if_addrs()?
         .iter()
-        .find(|i| !i.is_loopback() && matches!(i.addr, get_if_addrs::IfAddr::V4(_)))
+        .find(|i| !i.is_loopback() && matches!(i.addr, if_addrs::IfAddr::V4(_)))
         .map(|iface| Ok(iface.ip()))
         .unwrap_or_else(|| Err(Error::Other("No Local Ip Address Found")))
 }
 
 fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
     let mut broadcasts = vec![Ipv4Addr::BROADCAST];
-    for iface in get_if_addrs::get_if_addrs()?.iter() {
-        if let get_if_addrs::IfAddr::V4(ifacev4) = &iface.addr {
+    for iface in if_addrs::get_if_addrs()?.iter() {
+        if let if_addrs::IfAddr::V4(ifacev4) = &iface.addr {
             if let Some(broadcast) = ifacev4.broadcast.as_ref() {
                 broadcasts.push(*broadcast);
             }

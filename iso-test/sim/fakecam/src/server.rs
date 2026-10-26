@@ -88,6 +88,93 @@ struct Conn {
     /// The msg_num of the last motion alarm. A camera numbers the messages it
     /// sends of its own accord itself.
     motion_num: u16,
+    /// The talk being received
+    talk: Option<Talk>,
+}
+
+/// How talk sounds: ADPCM blocks of 512 bytes after their 4 byte header, at
+/// 16kHz, as Reolink cameras ask for
+const TALK_SAMPLE_RATE: u16 = 16000;
+const TALK_LENGTH_PER_ENCODER: u16 = 1024;
+
+fn talk_ability() -> TalkAbility {
+    TalkAbility {
+        version: "1.1".to_string(),
+        duplex_list: vec![DuplexList {
+            duplex: "FDX".to_string(),
+        }],
+        audio_stream_mode_list: vec![AudioStreamModeList {
+            audio_stream_mode: vec!["followVideoStream".to_string()],
+        }],
+        audio_config_list: vec![AudioConfigList {
+            audio_config: AudioConfig {
+                priority: Some(0),
+                audio_type: "adpcm".to_string(),
+                sample_rate: TALK_SAMPLE_RATE,
+                sample_precision: 16,
+                length_per_encoder: TALK_LENGTH_PER_ENCODER,
+                sound_track: "mono".to_string(),
+            },
+        }],
+    }
+}
+
+/// Seconds of sound in a talk message: ADPCM frames, each a 12 byte header,
+/// its block and padding to 8 bytes. A block holds one sample in its 4 byte
+/// header, and two in each byte after it.
+fn talk_seconds(mut payload: &[u8]) -> f64 {
+    const MAGIC: [u8; 4] = 0x62773130u32.to_le_bytes();
+    let mut samples = 0;
+    while payload.len() >= 12 && payload[..4] == MAGIC {
+        let block = usize::from(u16::from_le_bytes([payload[4], payload[5]])).saturating_sub(4);
+        if block >= 4 {
+            samples += (block - 4) * 2 + 1;
+        }
+        let frame = 12 + block + (8 - block % 8) % 8;
+        payload = payload.get(frame..).unwrap_or_default();
+    }
+    samples as f64 / f64::from(TALK_SAMPLE_RATE)
+}
+
+/// Talk as it comes from the client, played as it comes: in seconds since
+/// the first message
+struct Talk {
+    started: std::time::Instant,
+    /// Sound received
+    sound: f64,
+    messages: usize,
+    /// When what came will have played
+    playing_until: f64,
+    /// The most that came before it could play
+    ahead: f64,
+    /// How long nothing played, as what came last had played and what comes
+    /// next was late
+    silence: f64,
+}
+
+impl Talk {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            sound: 0.0,
+            messages: 0,
+            playing_until: 0.0,
+            ahead: 0.0,
+            silence: 0.0,
+        }
+    }
+
+    fn received(&mut self, payload: &[u8]) {
+        let now = self.started.elapsed().as_secs_f64();
+        let sound = talk_seconds(payload);
+        if self.messages > 0 && now > self.playing_until {
+            self.silence += now - self.playing_until;
+        }
+        self.playing_until = self.playing_until.max(now) + sound;
+        self.ahead = self.ahead.max(self.playing_until - now);
+        self.sound += sound;
+        self.messages += 1;
+    }
 }
 
 impl Conn {
@@ -420,6 +507,77 @@ impl Conn {
                 }
                 self.ack(&meta).await
             }
+            // ---- Talk: the client's sound, played as it comes
+            (MSG_ID_TALKABILITY, _) => {
+                self.xml_ok(
+                    &meta,
+                    BcXml {
+                        talk_ability: Some(talk_ability()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+            (MSG_ID_TALKCONFIG, _) if self.cfg.talk_busy.swap(false, Ordering::Relaxed) => {
+                // As when another client talks: the client stops it, and asks
+                // again
+                info!("talk config refused: busy");
+                self.reply(Bc::new_from_meta(self.meta(&meta, 0x0000, 422)))
+                    .await
+            }
+            (
+                MSG_ID_TALKCONFIG,
+                BcBody::ModernMsg(ModernMsg {
+                    payload:
+                        Some(BcPayloads::BcXml(BcXml {
+                            talk_config: Some(_),
+                            ..
+                        })),
+                    ..
+                }),
+            ) => {
+                info!("talk config accepted");
+                self.talk = None;
+                self.ack(&meta).await
+            }
+            (
+                MSG_ID_TALK,
+                BcBody::ModernMsg(ModernMsg {
+                    payload: Some(BcPayloads::Binary(payload)),
+                    ..
+                }),
+            ) => {
+                self.talk.get_or_insert_with(Talk::new).received(payload);
+                if self.cfg.talk_ack_delay.is_zero() {
+                    return self.ack(&meta).await;
+                }
+                // Late, as over a slow network, without holding up what comes
+                let ack = Bc::new_from_meta(self.meta(&meta, 0x0000, 200));
+                let (codec, out) = (self.codec.clone(), self.out.clone());
+                let delay = self.cfg.talk_ack_delay;
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let bytes = codec.lock().await.encode(&ack);
+                    if let Ok(bytes) = bytes {
+                        let _ = out.send(bytes).await;
+                    }
+                });
+                Ok(())
+            }
+            (MSG_ID_TALKRESET, _) => {
+                match self.talk.take() {
+                    Some(talk) => info!(
+                        "talk stop: {:.2}s of sound in {} messages, stopped after {:.2}s, at most {:.2}s ahead, {:.2}s of silence",
+                        talk.sound,
+                        talk.messages,
+                        talk.started.elapsed().as_secs_f64(),
+                        talk.ahead,
+                        talk.silence
+                    ),
+                    None => info!("talk stop"),
+                }
+                self.ack(&meta).await
+            }
             // Anything else gets the same 400 a real camera gives for a
             // feature it does not have.
             (id, _) => {
@@ -636,6 +794,7 @@ pub async fn serve(
         motion_requested: false,
         motion: motion.clone(),
         motion_num: 0,
+        talk: None,
     };
 
     let mut buf = BytesMut::with_capacity(16 * 1024);

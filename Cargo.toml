@@ -22,7 +22,6 @@ base64 = "0.22.0"
 byte-slice-cast = {version = "1.2.2", optional = true}
 bytes = "1.6.0"
 clap = { version = "4.2.2", features = ["derive", "cargo"] }
-crossbeam-channel = {version = "0.5.8", optional = true}
 dirs = {version = "5.0.1", optional = true}
 env_logger = "0.11.3"
 fcm-push-listener = {version = "2.0.3", optional = true}
@@ -62,8 +61,7 @@ gstreamer = [
   "dep:gstreamer-app",
   "dep:gstreamer-rtsp",
   "dep:gstreamer-rtsp-server",
-  "dep:byte-slice-cast",
-  "dep:crossbeam-channel"
+  "dep:byte-slice-cast"
 ]
 pushnoti = [
   "dep:fcm-push-listener",

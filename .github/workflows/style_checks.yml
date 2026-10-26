@@ -111,6 +111,8 @@ jobs:
         run: bash iso-test/sim/shutdown.sh
       - name: End-to-end healthcheck test
         run: bash iso-test/sim/healthcheck.sh
+      - name: End-to-end talk test
+        run: bash iso-test/sim/talk.sh
 
   check_deny:
     needs: pre_job

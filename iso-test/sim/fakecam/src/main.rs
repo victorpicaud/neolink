@@ -9,7 +9,7 @@ use clap::{Parser, ValueEnum};
 use log::*;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -72,6 +72,10 @@ pub struct Config {
     pub refuse_pings: bool,
     /// The camera's time zone, in seconds west of UTC as Reolink counts.
     pub time_zone: i32,
+    /// Refuse the next talk config as busy, as when another client talks.
+    pub talk_busy: AtomicBool,
+    /// How late talk is acknowledged, as over a slow network.
+    pub talk_ack_delay: std::time::Duration,
     /// Advertised video width.
     pub width: u32,
     /// Advertised video height.
@@ -110,6 +114,12 @@ struct Opt {
     /// -3600 for UTC+1
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     time_zone: i32,
+    /// Refuse the first talk config with a 422, as when another client talks
+    #[arg(long)]
+    talk_busy: bool,
+    /// Acknowledge talk this many milliseconds late, as over a slow network
+    #[arg(long, default_value_t = 0)]
+    talk_ack_delay: u64,
     /// Annex-B H.264 file to loop instead of the built-in test pattern
     #[arg(long)]
     h264: Option<PathBuf>,
@@ -154,6 +164,8 @@ async fn main() -> Result<()> {
         claimed_fps: opt.claimed_fps.unwrap_or(opt.fps),
         refuse_pings: opt.refuse_pings,
         time_zone: opt.time_zone,
+        talk_busy: AtomicBool::new(opt.talk_busy),
+        talk_ack_delay: std::time::Duration::from_millis(opt.talk_ack_delay),
         width: opt.width,
         height: opt.height,
     });

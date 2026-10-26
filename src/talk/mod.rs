@@ -13,6 +13,8 @@
 ///
 use anyhow::{anyhow, Context, Result};
 use neolink_core::bc::xml::TalkConfig;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod cmdline;
 mod gst;
@@ -90,12 +92,14 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         _ => unreachable!(),
     };
 
+    // Shared with each try of the task, should the camera reconnect
+    let rx = Arc::new(Mutex::new(rx));
     camera
         .run_task(|cam| {
             let rx = rx.clone();
             let talk_config = talk_config.clone();
             Box::pin(async move {
-                cam.talk_stream(rx, talk_config).await?;
+                cam.talk_stream(&mut *rx.lock().await, talk_config).await?;
                 Ok(())
             })
         })

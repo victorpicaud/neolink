@@ -68,6 +68,8 @@ pub struct Config {
     pub fps: u8,
     /// Advertised frame rate, which a real camera does not always keep to.
     pub claimed_fps: u8,
+    /// Answer pings with a 400, as some cameras do.
+    pub refuse_pings: bool,
     /// Advertised video width.
     pub width: u32,
     /// Advertised video height.
@@ -99,6 +101,9 @@ struct Opt {
     /// can send fewer than it says, in the dark for instance.
     #[arg(long)]
     claimed_fps: Option<u8>,
+    /// Answer pings with a 400, as some cameras do
+    #[arg(long)]
+    refuse_pings: bool,
     /// Annex-B H.264 file to loop instead of the built-in test pattern
     #[arg(long)]
     h264: Option<PathBuf>,
@@ -141,6 +146,7 @@ async fn main() -> Result<()> {
         encryption: opt.encryption.byte(),
         fps: opt.fps,
         claimed_fps: opt.claimed_fps.unwrap_or(opt.fps),
+        refuse_pings: opt.refuse_pings,
         width: opt.width,
         height: opt.height,
     });

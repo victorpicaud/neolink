@@ -99,6 +99,8 @@ jobs:
         run: bash iso-test/sim/mqtt-burst.sh
       - name: End-to-end login test
         run: bash iso-test/sim/login.sh
+      - name: End-to-end liveness test
+        run: bash iso-test/sim/liveness.sh
 
   check_deny:
     needs: pre_job

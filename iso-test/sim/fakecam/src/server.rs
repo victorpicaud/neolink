@@ -270,6 +270,7 @@ impl Conn {
             // ---- Liveness. neolink's watchdog pings with MSG_ID_PING and
             // wants a LinkType back (get_linktype), so a bare 200 is not
             // enough.
+            (MSG_ID_PING, _) if self.cfg.refuse_pings => self.nack(&meta).await,
             (MSG_ID_PING, _) => {
                 self.xml_ok(
                     &meta,

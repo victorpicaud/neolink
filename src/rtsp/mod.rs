@@ -87,8 +87,9 @@ const STREAM_INFO_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Entry point for the rtsp subcommand
 ///
-/// Opt is the command line options
-pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
+/// Opt is the command line options. It serves until `stop` is cancelled, or
+/// fails.
+pub(crate) async fn main(_opt: Opt, reactor: NeoReactor, stop: CancellationToken) -> Result<()> {
     let rtsp = Arc::new(NeoRtspServer::new()?);
 
     let global_cancel = CancellationToken::new();
@@ -174,21 +175,28 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
     set.spawn(async move { thread_rtsp.join().await });
 
     // None of these tasks ends on its own, so whichever ends first stops the
-    // others, and neolink exits with its error
-    let first = match set.join_next().await {
-        Some(Ok(ended)) => ended,
-        Some(Err(e)) => Err(e.into()),
-        None => Ok(()),
+    // others, and neolink exits with its error. Being asked to stop is no
+    // error.
+    let first = tokio::select! {
+        _ = stop.cancelled() => None,
+        ended = set.join_next() => Some(match ended {
+            Some(Ok(ended)) => ended,
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(()),
+        }),
     };
     global_cancel.cancel();
     rtsp.quit();
     let stopping = async { while set.join_next().await.is_some() {} };
-    if timeout(Duration::from_secs(10), stopping).await.is_err() {
-        warn!("The RTSP server took over 10s to stop");
+    if timeout(Duration::from_secs(5), stopping).await.is_err() {
+        warn!("The RTSP server took over 5s to stop");
     }
-    Err(first
-        .err()
-        .unwrap_or_else(|| anyhow!("The RTSP server stopped")))
+    match first {
+        None => Ok(()),
+        Some(first) => Err(first
+            .err()
+            .unwrap_or_else(|| anyhow!("The RTSP server stopped"))),
+    }
 }
 
 /// This keeps the users in rtsp and the config in sync

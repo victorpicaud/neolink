@@ -29,11 +29,12 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use env_logger::Env;
 use log::*;
-use std::fs;
+use std::{fs, future::Future, time::Duration};
+use tokio_util::sync::CancellationToken;
 use validator::Validate;
 
 mod battery;
@@ -61,8 +62,19 @@ use config::Config;
 
 pub(crate) type AnyResult<T> = Result<T, anyhow::Error>;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Could not start the async runtime")?;
+    let result = runtime.block_on(run());
+    // A blocking task still running, like a DNS lookup that hangs, used to
+    // keep neolink from exiting
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn run() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     // In the log, where they can be found with the rest, timestamped
     let default_hook = std::panic::take_hook();
@@ -94,16 +106,17 @@ async fn main() -> Result<()> {
     }
     mqtt::set_client_id(&conf_path, &config);
 
+    let stop = stop_on_signal();
     let neo_reactor = NeoReactor::new(config.clone()).await;
 
-    match opt.cmd {
+    let result = match opt.cmd {
         #[cfg(feature = "gstreamer")]
         None => {
             warn!(
                 "Deprecated command line option. Please use: `neolink rtsp --config={:?}`",
                 conf_path
             );
-            rtsp::main(rtsp::Opt {}, neo_reactor.clone()).await?;
+            rtsp::main(rtsp::Opt {}, neo_reactor.clone(), stop).await
         }
         #[cfg(not(feature = "gstreamer"))]
         None => {
@@ -112,52 +125,140 @@ async fn main() -> Result<()> {
                 "Deprecated command line option. Please use: `neolink mqtt --config={:?}`",
                 conf_path
             );
-            mqtt::main(mqtt::Opt {}, neo_reactor.clone()).await?;
+            mqtt::main(mqtt::Opt {}, neo_reactor.clone(), stop).await
         }
         #[cfg(feature = "gstreamer")]
-        Some(Command::Rtsp(opts)) => {
-            rtsp::main(opts, neo_reactor.clone()).await?;
-        }
+        Some(Command::Rtsp(opts)) => rtsp::main(opts, neo_reactor.clone(), stop).await,
         Some(Command::StatusLight(opts)) => {
-            statusled::main(opts, neo_reactor.clone()).await?;
+            unless_stopped(&stop, statusled::main(opts, neo_reactor.clone())).await
         }
         Some(Command::Reboot(opts)) => {
-            reboot::main(opts, neo_reactor.clone()).await?;
+            unless_stopped(&stop, reboot::main(opts, neo_reactor.clone())).await
         }
         Some(Command::Pir(opts)) => {
-            pir::main(opts, neo_reactor.clone()).await?;
+            unless_stopped(&stop, pir::main(opts, neo_reactor.clone())).await
         }
         Some(Command::Ptz(opts)) => {
-            ptz::main(opts, neo_reactor.clone()).await?;
+            unless_stopped(&stop, ptz::main(opts, neo_reactor.clone())).await
         }
         #[cfg(feature = "gstreamer")]
         Some(Command::Talk(opts)) => {
-            talk::main(opts, neo_reactor.clone()).await?;
+            unless_stopped(&stop, talk::main(opts, neo_reactor.clone())).await
         }
-        Some(Command::Mqtt(opts)) => {
-            mqtt::main(opts, neo_reactor.clone()).await?;
-        }
+        Some(Command::Mqtt(opts)) => mqtt::main(opts, neo_reactor.clone(), stop).await,
         #[cfg(feature = "gstreamer")]
         Some(Command::MqttRtsp(opts)) => {
-            tokio::select! {
-                v = mqtt::main(opts, neo_reactor.clone()) => v,
-                v = rtsp::main(rtsp::Opt {}, neo_reactor.clone()) => v,
-            }?;
+            // Whichever ends first stops the other, and both are waited
+            // for: the other used to be dropped wherever it was
+            let both = stop.child_token();
+            let (mqtt, rtsp) = tokio::join!(
+                async {
+                    let ended = mqtt::main(opts, neo_reactor.clone(), both.clone()).await;
+                    both.cancel();
+                    ended
+                },
+                async {
+                    let ended = rtsp::main(rtsp::Opt {}, neo_reactor.clone(), both.clone()).await;
+                    both.cancel();
+                    ended
+                },
+            );
+            mqtt.and(rtsp)
         }
         #[cfg(feature = "gstreamer")]
         Some(Command::Image(opts)) => {
-            image::main(opts, neo_reactor.clone()).await?;
+            unless_stopped(&stop, image::main(opts, neo_reactor.clone())).await
         }
         Some(Command::Battery(opts)) => {
-            battery::main(opts, neo_reactor.clone()).await?;
+            unless_stopped(&stop, battery::main(opts, neo_reactor.clone())).await
         }
         Some(Command::Services(opts)) => {
-            services::main(opts, neo_reactor.clone()).await?;
+            unless_stopped(&stop, services::main(opts, neo_reactor.clone())).await
         }
         Some(Command::Users(opts)) => {
-            users::main(opts, neo_reactor.clone()).await?;
+            unless_stopped(&stop, users::main(opts, neo_reactor.clone())).await
         }
+    };
+
+    // Logged out of every camera, rather than leaving each to time its
+    // session out
+    neo_reactor.shutdown().await;
+    result
+}
+
+/// Runs a command that does its one thing and ends, unless neolink is asked
+/// to stop first
+async fn unless_stopped(
+    stop: &CancellationToken,
+    command: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        ended = command => ended,
+        _ = stop.cancelled() => Err(anyhow!("Stopped before it was done")),
+    }
+}
+
+/// Stops neolink cleanly on the first SIGINT or SIGTERM, and at once on the
+/// second. SIGTERM used to kill neolink on the spot, before it logged out of
+/// its cameras. And as the first process of a container, where signals
+/// without a handler are ignored, neolink ignored SIGTERM until it was killed.
+fn stop_on_signal() -> CancellationToken {
+    let stop = CancellationToken::new();
+    let signalled = stop.clone();
+    tokio::spawn(async move {
+        let mut signals = match Signals::new() {
+            Ok(signals) => signals,
+            Err(e) => {
+                warn!("Could not listen for the signals to stop: {e}");
+                return;
+            }
+        };
+        signals.recv().await;
+        info!("Stopping. Send the signal again to stop at once.");
+        signalled.cancel();
+        signals.recv().await;
+        warn!("Stopping at once");
+        std::process::exit(1);
+    });
+    stop
+}
+
+/// SIGINT and SIGTERM
+#[cfg(unix)]
+struct Signals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
     }
 
-    Ok(())
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
+/// Ctrl+C
+#[cfg(not(unix))]
+struct Signals;
+
+#[cfg(not(unix))]
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

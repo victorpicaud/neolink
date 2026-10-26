@@ -4,7 +4,7 @@
 //!
 //! The camera watch is used as an event to be triggered
 //! whenever the camera is lost/updated
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use futures::TryFutureExt;
 use std::sync::{Arc, Weak};
 use tokio::{
@@ -18,6 +18,19 @@ use tokio_util::sync::CancellationToken;
 use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
 use neolink_core::bc_protocol::BcCamera;
+
+/// The camera is going away for good: it was removed from the config, or
+/// neolink is stopping
+#[derive(Debug)]
+pub(crate) struct CameraGone;
+
+impl std::fmt::Display for CameraGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Camera is disconnecting")
+    }
+}
+
+impl std::error::Error for CameraGone {}
 
 #[cfg(feature = "gstreamer")]
 mod gst;
@@ -111,10 +124,10 @@ impl NeoInstance {
                 })
                 .map_ok(|new_cam| new_cam.upgrade())
                 .await
-                .with_context(|| "Camera is disconnecting")?;
+                .map_err(|_| CameraGone)?;
             break tokio::select! {
                 _ = self.cancel.cancelled() => {
-                    Err(anyhow!("Camera is disconnecting"))
+                    Err(CameraGone.into())
                 }
                 _ = camera_watch.wait_for(|new_cam| !Weak::ptr_eq(new_cam, &camera.as_ref().map(Arc::downgrade).unwrap_or_default())).map_ok(|new_cam| new_cam.upgrade()) => {
                     // Camera value has changed!

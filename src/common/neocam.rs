@@ -14,7 +14,7 @@ use tokio::{
         watch::{channel as watch, Receiver as WatchReceiver, Sender as WatchSender},
     },
     task::JoinSet,
-    time::{sleep, Duration},
+    time::{sleep, timeout, Duration},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -470,6 +470,22 @@ impl NeoCam {
         });
         Ok(())
     }
+
+    /// Stops the camera, which logs out, and waits for it. Whatever has not
+    /// stopped in time is aborted.
+    pub(crate) async fn shutdown(mut self) {
+        const STOP_TIME: Duration = Duration::from_secs(3);
+        self.cancel.cancel();
+        let mut set = std::mem::take(&mut self.set);
+        let stopped = timeout(STOP_TIME, async {
+            while set.join_next().await.is_some() {}
+        })
+        .await;
+        if stopped.is_err() {
+            let name = self.config_watch.borrow().name.clone();
+            log::warn!("{name}: The camera took over {STOP_TIME:?} to stop");
+        }
+    }
 }
 
 impl Drop for NeoCam {
@@ -513,6 +529,20 @@ mod tests {
         );
         camera.update_config(camera_config(false)).await?;
         assert!(config.has_changed()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_camera_stops_when_told() -> AnyResult<()> {
+        #[cfg(feature = "pushnoti")]
+        let camera = NeoCam::new(camera_config(true), tokio::sync::mpsc::channel(1).0).await?;
+        #[cfg(not(feature = "pushnoti"))]
+        let camera = NeoCam::new(camera_config(true)).await?;
+        let instance = camera.subscribe().await?;
+
+        // Well before its time to stop runs out, since every task stops
+        timeout(Duration::from_secs(2), camera.shutdown()).await?;
+        assert!(instance.config().await.is_err(), "the camera still answers");
         Ok(())
     }
 }

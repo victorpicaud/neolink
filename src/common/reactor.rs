@@ -23,6 +23,8 @@ use crate::{config::Config, AnyResult, Result};
 #[allow(clippy::large_enum_variant)]
 enum NeoReactorCommand {
     HangUp,
+    /// Stops every camera, logged out, then the reactor
+    Shutdown(OneshotSender<()>),
     Config(OneshotSender<WatchReceiver<Config>>),
     UpdateConfig(Config, OneshotSender<Result<()>>),
     Get(String, OneshotSender<Result<Option<NeoInstance>>>),
@@ -66,6 +68,18 @@ impl NeoReactor {
                                 instances.clear();
                                 cancel2.cancel();
                                 return Result::<(), anyhow::Error>::Ok(());
+                            }
+                            NeoReactorCommand::Shutdown(reply) => {
+                                // All at once, as each may have to wait for
+                                // its camera
+                                let mut stopping = JoinSet::new();
+                                for (_, camera) in instances.drain() {
+                                    stopping.spawn(camera.shutdown());
+                                }
+                                while stopping.join_next().await.is_some() {}
+                                cancel2.cancel();
+                                let _ = reply.send(());
+                                return Ok(());
                             }
                             NeoReactorCommand::Config(reply) =>  {
                                 let _ = reply.send(thread_config_tx.subscribe());
@@ -175,6 +189,21 @@ impl NeoReactor {
 
         sender_rx.await?
     }
+
+    /// Stops every camera, logged out. Cameras that were only dropped as
+    /// neolink exited never logged out: dropping left that to tasks that
+    /// exiting cut short.
+    pub(crate) async fn shutdown(&self) {
+        let (sender_tx, sender_rx) = oneshot();
+        if self
+            .commander
+            .send(NeoReactorCommand::Shutdown(sender_tx))
+            .await
+            .is_ok()
+        {
+            let _ = sender_rx.await;
+        }
+    }
 }
 
 impl Drop for NeoReactor {
@@ -191,5 +220,25 @@ impl Drop for NeoReactor {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn shutting_down_stops_the_cameras_then_the_reactor() -> AnyResult<()> {
+        let config: Config = toml::from_str(
+            "[[cameras]]\nname = \"cam\"\nusername = \"admin\"\naddress = \"127.0.0.1:1\"\npush_notifications = false\n",
+        )?;
+        let reactor = NeoReactor::new(config).await;
+        reactor.get("cam").await?;
+
+        // Well before a camera's time to stop runs out, since none is slow
+        timeout(Duration::from_secs(2), reactor.shutdown()).await?;
+        assert!(reactor.get("cam").await.is_err(), "the reactor still runs");
+        Ok(())
     }
 }

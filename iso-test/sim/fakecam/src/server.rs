@@ -233,6 +233,7 @@ impl Conn {
             }
             (MSG_ID_LOGOUT, _) => {
                 self.logged_in = false;
+                info!("logout");
                 self.ack(&meta).await
             }
             // ---- The abilities gate. start_video refuses to run without

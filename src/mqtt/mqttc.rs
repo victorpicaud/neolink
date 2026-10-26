@@ -196,14 +196,17 @@ impl Mqtt {
     }
 }
 
-impl Drop for Mqtt {
-    fn drop(&mut self) {
-        log::trace!("Drop MQTT");
+impl Mqtt {
+    /// Says that neolink is offline, and leaves the broker
+    pub(crate) async fn shutdown(mut self) {
+        self.hang_up().await
+    }
+
+    fn hang_up(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let outgoing_tx = self.outgoing_tx.clone();
         let cancel = self.cancel.clone();
         let mut set = std::mem::take(&mut self.set);
-
-        crate::utils::spawn_cleanup(async move {
+        async move {
             let (tx, rx) = oneshot();
             // Not for long: no one answers while the config cannot work
             let _ = timeout(Duration::from_secs(3), async {
@@ -216,7 +219,14 @@ impl Drop for Mqtt {
             cancel.cancel();
             while set.join_next().await.is_some() {}
             log::trace!("Dropped MQTT");
-        });
+        }
+    }
+}
+
+impl Drop for Mqtt {
+    fn drop(&mut self) {
+        log::trace!("Drop MQTT");
+        crate::utils::spawn_cleanup(self.hang_up());
     }
 }
 

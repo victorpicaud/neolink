@@ -20,7 +20,7 @@ use tokio::{
 
 #[cfg(feature = "pushnoti")]
 use super::PushNoti;
-use super::{Backoff, MdState, NeoInstance};
+use super::{Backoff, CameraGone, MdState, NeoInstance};
 use crate::{config::CameraConfig, AnyResult};
 
 /// How long the camera keeps streaming after the last subscriber leaves, for
@@ -428,6 +428,12 @@ async fn run(
                 log::debug!("{name}: Stopped the camera stream");
                 backoff.reset();
                 restarts = 0;
+            }
+            // And this hub with it. Taking it for a failure, to retry, made
+            // stopping neolink look like one.
+            Stopped::Ended(Err(e)) if e.is::<CameraGone>() => {
+                log::debug!("{name}: The camera is gone");
+                return;
             }
             Stopped::Ended(result) => {
                 if restarts >= RESTARTS_BEFORE_RECONNECT {
@@ -940,6 +946,25 @@ mod tests {
 
         let starts = starts.load(Ordering::SeqCst);
         assert!((2..50).contains(&starts), "{starts} starts in a minute");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_camera_that_is_gone_ends_its_hub_without_retrying() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let counted = starts.clone();
+        let source: StreamSource = Box::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { Err(CameraGone.into()) }.boxed()
+        });
+        let (hub, _gate) = hub(source, true);
+        let mut subscription = hub.subscribe().unwrap();
+        sleep(Duration::from_secs(60)).await;
+
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            subscription.events.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
     }
 
     #[tokio::test(start_paused = true)]

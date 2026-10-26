@@ -98,8 +98,9 @@ use self::{
 
 /// Entry point for the mqtt subcommand
 ///
-/// Opt is the command line options
-pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
+/// Opt is the command line options. It runs until `stop` is cancelled, or
+/// fails.
+pub(crate) async fn main(_: Opt, reactor: NeoReactor, stop: CancellationToken) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
     let global_cancel = CancellationToken::new();
     let cancel_drop = global_cancel.clone().drop_guard();
@@ -220,19 +221,29 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
     });
 
     // None of these tasks ends on its own, so whichever ends first stops the
-    // others, and neolink exits with its error
-    let first = match set.join_next().await {
-        Some(Ok(ended)) => ended,
-        Some(Err(e)) => Err(e.into()),
-        None => Ok(()),
+    // others, and neolink exits with its error. Being asked to stop is no
+    // error.
+    let first = tokio::select! {
+        _ = stop.cancelled() => None,
+        ended = set.join_next() => Some(match ended {
+            Some(Ok(ended)) => ended,
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(()),
+        }),
     };
     global_cancel.cancel();
     let stopping = async { while set.join_next().await.is_some() {} };
-    if timeout(Duration::from_secs(10), stopping).await.is_err() {
-        warn!("MQTT took over 10s to stop");
+    if timeout(Duration::from_secs(5), stopping).await.is_err() {
+        warn!("MQTT took over 5s to stop");
     }
     drop(cancel_drop);
-    Err(first.err().unwrap_or_else(|| anyhow!("MQTT stopped")))
+    // Offline and gone from the broker before neolink exits: dropping the
+    // client left that to a task that exiting cut short
+    mqtt.shutdown().await;
+    match first {
+        None => Ok(()),
+        Some(first) => Err(first.err().unwrap_or_else(|| anyhow!("MQTT stopped"))),
+    }
 }
 
 /// The configs neolink published on neolink/config that have not come back

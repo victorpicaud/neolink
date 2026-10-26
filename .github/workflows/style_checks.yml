@@ -103,6 +103,8 @@ jobs:
         run: bash iso-test/sim/liveness.sh
       - name: End-to-end camera time test
         run: bash iso-test/sim/camera-time.sh
+      - name: End-to-end motion test (over MQTT)
+        run: bash iso-test/sim/motion.sh
 
   check_deny:
     needs: pre_job

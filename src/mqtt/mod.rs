@@ -427,7 +427,8 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                 mqtt_motion.send_message("status/motion", "on", true).await.with_context(|| {
                                     format!("{}: Failed to publish motion start", camera_name)
                                 })?;
-                                md.wait_for(|state| matches!(state, MdState::Stop(_))).await.with_context(|| {
+                                // Unknown too: the camera went away
+                                md.wait_for(|state| !matches!(state, MdState::Start(_))).await.with_context(|| {
                                     format!("{}: MdStop Watch Dropped", camera_name)
                                 })?;
                                 mqtt_motion.send_message("status/motion", "off", true).await.with_context(|| {

@@ -67,6 +67,19 @@ impl NeoCamMdThread {
                 }
                 Ok(())
             } => v,
+            // Motion is unknown while the camera is away: the last state
+            // held, and an alarm that the camera could no longer end kept
+            // the camera awake, and showed as motion, for good
+            v = async {
+                let mut camera = md_instance.camera();
+                loop {
+                    camera.wait_for(|camera| camera.upgrade().is_none()).await?;
+                    watcher.send_if_modified(|state| {
+                        !matches!(std::mem::replace(state, MdState::Unknown), MdState::Unknown)
+                    });
+                    camera.wait_for(|camera| camera.upgrade().is_some()).await?;
+                }
+            } => v,
             v = async {
                 loop {
                     let r: AnyResult<()> = md_instance.run_passive_task(|cam| {

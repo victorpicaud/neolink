@@ -372,7 +372,8 @@ impl NeoCam {
                     loop{
                         md.wait_for(|md| matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
                         let _permit = md_permit_instance.permit().await.with_context(|| "Unuable to acquire motion permit")?;
-                        md.wait_for(|md| matches!(md, MdState::Stop(_))).await.with_context(|| "MD Watcher lost")?;
+                        // Unknown too: the camera went away
+                        md.wait_for(|md| !matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
                         // Try waiting for 30s
                         // If in those 30s we get motion then return to
                         // loop early to reaquire the permit

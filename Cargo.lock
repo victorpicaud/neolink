@@ -1833,6 +1833,7 @@ dependencies = [
  "md5",
  "neolink_core",
  "quick-xml",
+ "rand 0.8.8",
  "regex",
  "rumqttc",
  "serde",

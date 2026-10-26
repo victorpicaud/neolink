@@ -60,6 +60,20 @@ start_fakecam() {
   PIDS+=($!)
 }
 
+# start_mosquitto PORT: runs an MQTT broker on loopback
+start_mosquitto() {
+  printf 'listener %s 127.0.0.1\nallow_anonymous true\n' "$1" > "$WORK/mosquitto.conf"
+  mosquitto -c "$WORK/mosquitto.conf" > "$WORK/mosquitto.log" 2>&1 &
+  PIDS+=($!)
+  for _ in $(seq 1 50); do
+    if mosquitto_pub -h 127.0.0.1 -p "$1" -t neolink-test/ping -m ping 2> /dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  fail "mosquitto did not start"
+}
+
 # start_neolink CONFIG [SUBCOMMAND]: runs neolink in the background
 start_neolink() {
   "$NEOLINK_BIN" "${2:-rtsp}" --config "$1" > "$WORK/neolink.log" 2>&1 &
@@ -106,6 +120,21 @@ wait_for_codec() {
     sleep 1
   done
   fail "$1 never served $2 (last answer: ${out:-none})"
+}
+
+# wait_for_answer URL PATTERN SECONDS: waits up to SECONDS for ffprobe's
+# answer from URL to match the grep pattern
+wait_for_answer() {
+  local out deadline=$((SECONDS + $3))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    out=$(probe "$1" 15) || true
+    if echo "$out" | grep -q -- "$2"; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "  last answer from $1: ${out:-none}"
+  return 1
 }
 
 # fail MESSAGE: prints the message and the logs, then exits

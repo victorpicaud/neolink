@@ -97,6 +97,10 @@ impl NeoReactor {
                             NeoReactorCommand::UpdateConfig(new_conf, reply) => {
                                 // Shutdown or Notify instances of a change
                                 let mut names = new_conf.cameras.iter().filter(|cam_conf| cam_conf.enabled).map(|cam_conf| (cam_conf.name.clone(), cam_conf.clone())).collect::<HashMap<_,_>>();
+                                // Set the new conf first, so that whatever
+                                // runs a removed camera learns it was removed
+                                // before the camera goes away under it
+                                let _ = thread_config_tx.send_replace(new_conf);
                                 // Remove those no longer in the config
                                 instances.retain(|name, _| names.contains_key(name));
                                 for (name, instance) in instances.iter() {
@@ -105,8 +109,6 @@ impl NeoReactor {
                                     }
                                 }
 
-                                // Set the new conf
-                                let _ = thread_config_tx.send_replace(new_conf);
                                 // Reply that we are done
                                 let _ = reply.send(Ok(()));
                             }

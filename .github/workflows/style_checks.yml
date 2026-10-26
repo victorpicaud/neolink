@@ -68,7 +68,7 @@ jobs:
             libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-x \
-            protobuf-compiler libssl-dev ffmpeg
+            protobuf-compiler libssl-dev ffmpeg mosquitto mosquitto-clients
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -87,6 +87,8 @@ jobs:
         run: bash iso-test/sim/smoke.sh
       - name: End-to-end stuck camera test
         run: bash iso-test/sim/stuck-camera.sh
+      - name: End-to-end config reload test (over MQTT)
+        run: bash iso-test/sim/config-reload.sh
 
   check_deny:
     needs: pre_job

@@ -60,7 +60,7 @@
 //! `credentials` are the username and password required to identify with the mqtt server
 //!
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::{
     sync::mpsc::channel as mpsc,
     task::JoinSet,
@@ -77,7 +77,7 @@ mod discovery;
 mod mqttc;
 
 use crate::{
-    common::{MdState, NeoInstance, NeoReactor},
+    common::{supervise_cameras, MdState, NeoInstance, NeoReactor},
     config::Config,
     AnyResult,
 };
@@ -100,72 +100,31 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
     let global_cancel = CancellationToken::new();
     let cancel_drop = global_cancel.clone().drop_guard();
     let config = reactor.config().await?;
+    if config.borrow().mqtt.is_none() {
+        // Without it nothing would ever answer, and neolink would just hang
+        return Err(anyhow!("MQTT needs an [mqtt] section in the config"));
+    }
     let mqtt = Mqtt::new(config.clone()).await;
 
-    // Startup and stop cameras as they are added/removed to the config
-    let thread_cancel = global_cancel.clone();
-    let mut thread_config = config.clone();
+    // Start and stop each camera's MQTT handler as cameras are enabled and
+    // disabled, and restart them if they fail
     let thread_reactor = reactor.clone();
-    let thread_instance = mqtt.subscribe("").await?;
-    set.spawn(async move {
-        let mut set = JoinSet::<AnyResult<()>>::new();
-        let thread_cancel2 = thread_cancel.clone();
-        tokio::select!{
-            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-            v = async {
-                let mut cameras: HashMap<String, CancellationToken> = Default::default();
-                let mut config_names = HashSet::new();
-                loop {
-                    thread_config.wait_for(|config| {
-                        let current_names = config.cameras.iter().filter(|a| a.enabled).map(|cam_config| cam_config.name.clone()).collect::<HashSet<_>>();
-                        current_names != config_names
-                    }).await.with_context(|| "Camera Config Watcher")?;
-                    config_names = thread_config.borrow().clone().cameras.iter().filter(|a| a.enabled).map(|cam_config| cam_config.name.clone()).collect::<HashSet<_>>();
-
-                    for name in config_names.iter() {
-                        log::info!("{name}: MQTT Starting");
-                        if ! cameras.contains_key(name) {
-                            let local_cancel = CancellationToken::new();
-                            cameras.insert(name.clone(),local_cancel.clone());
-
-                            let thread_global_cancel = thread_cancel2.clone();
-                            let thread_reactor2 = thread_reactor.clone();
-                            let mqtt_instance = thread_instance.subscribe(name).await?;
-                            let name = name.clone();
-                            set.spawn(async move {
-                                loop {
-                                    let camera = thread_reactor2.get(&name).await?;
-                                    let mqtt_instance = mqtt_instance.resubscribe().await?;
-                                    let r = tokio::select!{
-                                        _ = thread_global_cancel.cancelled() => {
-                                            AnyResult::Ok(())
-                                        },
-                                        _ = local_cancel.cancelled() => {
-                                            AnyResult::Ok(())
-                                        },
-                                        v = listen_on_camera(camera, mqtt_instance) => {
-                                            v
-                                        },
-                                    };
-                                    if let Ok(()) = &r {
-                                        break r
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                            }) ;
-                        }
-                    }
-
-                    for (running_name, token) in cameras.iter() {
-                        if ! config_names.contains(running_name) {
-                            token.cancel();
-                        }
-                    }
-                }
-            } => v,
-        }
-    });
+    let thread_instance = Arc::new(mqtt.subscribe("").await?);
+    set.spawn(supervise_cameras(
+        "MQTT",
+        config.clone(),
+        global_cancel.clone(),
+        move |name| {
+            let reactor = thread_reactor.clone();
+            let instance = thread_instance.clone();
+            async move {
+                let camera = reactor.get(&name).await?;
+                let mqtt_instance = instance.subscribe(name).await?;
+                listen_on_camera(camera, mqtt_instance).await
+            }
+        },
+        |_: &str| {},
+    ));
 
     // This threads prints the config
     let mut thread_config = config.clone();

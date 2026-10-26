@@ -6,7 +6,7 @@
 use super::AnyResult;
 use crate::config::*;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use gstreamer::glib::{self, object_subclass, MainLoop, Object};
 use gstreamer_rtsp::RTSPAuthMethod;
 use gstreamer_rtsp_server::{
@@ -19,12 +19,11 @@ use log::*;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    sync::Arc,
+    sync::OnceLock,
 };
 use tokio::{
     sync::RwLock,
-    task::JoinSet,
-    time::{timeout, Duration},
+    time::{interval, Duration},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -82,7 +81,9 @@ impl NeoRtspServer {
         Ok(factory)
     }
 
-    pub(crate) async fn run(&self, bind_addr: &str, bind_port: u16) -> AnyResult<()> {
+    /// Starts serving until [`Self::quit`]. The returned guard quits when it
+    /// is dropped, so the server stops however the code that started it ends.
+    pub(crate) async fn run(&self, bind_addr: &str, bind_port: u16) -> AnyResult<QuitOnDrop> {
         let server = self;
         server.set_address(bind_addr);
         server.set_service(&format!("{}", bind_port));
@@ -93,71 +94,74 @@ impl NeoRtspServer {
             .create_source(None::<&Cancellable>)
             .with_context(|| format!("Could not listen for RTSP on {bind_addr}:{bind_port}"))?
             .attach(None);
-        let main_loop = Arc::new(MainLoop::new(None, false));
 
-        // Run the Glib main loop.
-        let main_loop_thread = main_loop.clone();
-        let main_loop_cancel = CancellationToken::new();
-        let main_loop_gaurd = main_loop_cancel.clone().drop_guard();
-        let handle = tokio::task::spawn_blocking(move || {
-            main_loop_thread.run();
-            drop(main_loop_gaurd);
-            AnyResult::Ok(())
-        });
-        timeout(Duration::from_secs(5), self.imp().threads.write())
-            .await
-            .with_context(|| "Timeout waiting to lock Server threads")?
-            .spawn(async move { handle.await? });
+        let main_loop = MainLoop::new(None, false);
+        let stopped = CancellationToken::new();
+        self.imp()
+            .main_loop
+            .set((main_loop.clone(), stopped.clone()))
+            .map_err(|_| anyhow!("The RTSP server is already running"))?;
 
-        let clean_up_server = server.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            while !main_loop_cancel.is_cancelled() {
-                if let Some(sessions) = clean_up_server.session_pool() {
-                    let cleanups = sessions.cleanup();
-                    if cleanups > 0 {
-                        log::debug!("Cleaned up {cleanups} sessions");
-                    }
-                    sessions.filter(Some(&mut |_, session| {
-                        let remaining = session.next_timeout_usec(glib::monotonic_time());
-                        log::debug!(
-                            "{:?}: {}/{}",
-                            session.sessionid(),
-                            remaining,
-                            session.timeout(),
-                        );
-                        RTSPFilterResult::Keep
-                    }));
+        // Run the Glib main loop on a thread of its own. On tokio's blocking
+        // pool, a loop that nobody quit kept the runtime, and so neolink, from
+        // ever exiting.
+        let thread_stopped = stopped.clone();
+        std::thread::Builder::new()
+            .name("rtsp-main-loop".to_string())
+            .spawn(move || {
+                let _stopped = thread_stopped.drop_guard();
+                main_loop.run();
+            })
+            .context("Could not start the RTSP main loop")?;
+
+        let sessions_server = server.clone();
+        tokio::task::spawn(async move {
+            let mut ticks = interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = stopped.cancelled() => break,
+                    _ = ticks.tick() => sessions_server.clean_up_sessions(),
                 }
-                std::thread::sleep(Duration::from_secs(5));
             }
-            AnyResult::Ok(())
         });
-        timeout(Duration::from_secs(5), self.imp().threads.write())
-            .await
-            .with_context(|| "Timeout waiting to lock Server threads")?
-            .spawn(async move { handle.await? });
-
-        // Put copy of main loop inside the rtsp server
-        timeout(Duration::from_secs(5), self.imp().main_loop.write())
-            .await
-            .with_context(|| "Timeout waiting to lock Server main_loop")?
-            .replace(main_loop);
-        Ok(())
+        Ok(QuitOnDrop(server.clone()))
     }
 
-    pub(crate) async fn quit(&self) -> AnyResult<()> {
-        if let Some(main_loop) = self.imp().main_loop.read().await.as_ref() {
-            main_loop.quit();
+    /// Stops the main loop. Any thread can call it, any number of times.
+    pub(crate) fn quit(&self) {
+        if let Some((main_loop, _)) = self.imp().main_loop.get() {
+            // Quit from inside the loop: a quit that came before the loop had
+            // started running would be lost
+            let main_loop = main_loop.clone();
+            glib::idle_add_once(move || main_loop.quit());
         }
-        Ok(())
     }
 
+    /// Waits for the main loop to stop
     pub(crate) async fn join(&self) -> AnyResult<()> {
-        let mut threads = self.imp().threads.write().await;
-        while let Some(thread) = threads.join_next().await {
-            thread??;
+        if let Some((_, stopped)) = self.imp().main_loop.get() {
+            stopped.cancelled().await;
         }
         Ok(())
+    }
+
+    fn clean_up_sessions(&self) {
+        if let Some(sessions) = self.session_pool() {
+            let cleanups = sessions.cleanup();
+            if cleanups > 0 {
+                log::debug!("Cleaned up {cleanups} sessions");
+            }
+            sessions.filter(Some(&mut |_, session| {
+                let remaining = session.next_timeout_usec(glib::monotonic_time());
+                log::debug!(
+                    "{:?}: {}/{}",
+                    session.sessionid(),
+                    remaining,
+                    session.timeout(),
+                );
+                RTSPFilterResult::Keep
+            }));
+        }
     }
 
     pub(crate) fn set_up_tls(&self, config: &Config) -> AnyResult<()> {
@@ -180,11 +184,22 @@ impl NeoRtspServer {
 unsafe impl Send for NeoRtspServer {}
 unsafe impl Sync for NeoRtspServer {}
 
+/// Quits the server's main loop when dropped
+#[derive(Debug)]
+#[must_use = "the server stops when this is dropped"]
+pub(crate) struct QuitOnDrop(NeoRtspServer);
+
+impl Drop for QuitOnDrop {
+    fn drop(&mut self) {
+        self.0.quit();
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct NeoRtspServerImpl {
-    threads: RwLock<JoinSet<AnyResult<()>>>,
     users: RwLock<HashMap<String, String>>,
-    main_loop: RwLock<Option<Arc<MainLoop>>>,
+    /// The main loop once it runs, and a token cancelled when it stops
+    main_loop: OnceLock<(MainLoop, CancellationToken)>,
 }
 
 impl ObjectImpl for NeoRtspServerImpl {}
@@ -278,23 +293,30 @@ impl NeoRtspServerImpl {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_port_in_use_fails_startup() -> AnyResult<()> {
+    #[tokio::test]
+    async fn a_port_in_use_fails_startup() -> AnyResult<()> {
         let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = taken.local_addr()?.port();
 
-        let runtime = tokio::runtime::Runtime::new()?;
-        let started =
-            runtime.block_on(async { NeoRtspServer::new()?.run("127.0.0.1", port).await });
-        // A server that did start runs its main loop on a blocking thread,
-        // which would hold up the runtime's shutdown forever
-        runtime.shutdown_background();
-
-        let error = started.expect_err("the port is already taken");
+        let error = NeoRtspServer::new()?
+            .run("127.0.0.1", port)
+            .await
+            .expect_err("the port is already taken");
         assert!(
             format!("{error:#}").contains("Could not listen for RTSP"),
             "{error:#}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_main_loop_stops_when_its_guard_is_dropped() -> AnyResult<()> {
+        let server = NeoRtspServer::new()?;
+        // Quit before the loop had a chance to start
+        drop(server.run("127.0.0.1", 0).await?);
+        tokio::time::timeout(Duration::from_secs(5), server.join())
+            .await
+            .context("the main loop is still running")??;
         Ok(())
     }
 }

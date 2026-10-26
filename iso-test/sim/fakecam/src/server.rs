@@ -352,7 +352,7 @@ impl Conn {
                     BcXml {
                         system_general: Some(SystemGeneral {
                             version: xml_ver(),
-                            time_zone: Some(0),
+                            time_zone: Some(self.cfg.time_zone),
                             year: Some(2026),
                             month: Some(1),
                             day: Some(1),
@@ -369,7 +369,29 @@ impl Conn {
                 )
                 .await
             }
-            (MSG_ID_SET_GENERAL, _) => self.ack(&meta).await,
+            (MSG_ID_SET_GENERAL, body) => {
+                if let BcBody::ModernMsg(ModernMsg {
+                    payload:
+                        Some(BcPayloads::BcXml(BcXml {
+                            system_general: Some(general),
+                            ..
+                        })),
+                    ..
+                }) = body
+                {
+                    info!(
+                        "set_time: time_zone {:?} {:?}-{:?}-{:?} {:?}:{:?}:{:?}",
+                        general.time_zone,
+                        general.year,
+                        general.month,
+                        general.day,
+                        general.hour,
+                        general.minute,
+                        general.second
+                    );
+                }
+                self.ack(&meta).await
+            }
             (MSG_ID_MOTION_REQUEST, _) => {
                 self.ack(&meta).await?;
                 self.motion_requested = true;

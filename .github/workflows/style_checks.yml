@@ -101,6 +101,8 @@ jobs:
         run: bash iso-test/sim/login.sh
       - name: End-to-end liveness test
         run: bash iso-test/sim/liveness.sh
+      - name: End-to-end camera time test
+        run: bash iso-test/sim/camera-time.sh
 
   check_deny:
     needs: pre_job

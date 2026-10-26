@@ -236,11 +236,13 @@ async fn update_camera_time(camera: &BcCamera, name: &str, update_time: bool) ->
         log::warn!("{}: Camera has no time set, Updating", name);
     }
     if update {
-        use std::time::SystemTime;
-        let new_time = SystemTime::now();
+        // In the camera's time zone: setting the time used to reset it to UTC
+        // (#361)
+        let offset = cam_time.map_or(time::UtcOffset::UTC, |time| time.offset());
+        let new_time = time::OffsetDateTime::now_utc().to_offset(offset);
 
-        log::info!("{}: Setting time to {:?}", name, new_time);
-        match camera.set_time(new_time.into()).await {
+        log::info!("{}: Setting time to {}", name, new_time);
+        match camera.set_time(new_time).await {
             Ok(_) => {
                 let cam_time = camera.get_time().await?;
                 if let Some(time) = cam_time {

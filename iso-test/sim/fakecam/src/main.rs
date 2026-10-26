@@ -70,6 +70,8 @@ pub struct Config {
     pub claimed_fps: u8,
     /// Answer pings with a 400, as some cameras do.
     pub refuse_pings: bool,
+    /// The camera's time zone, in seconds west of UTC as Reolink counts.
+    pub time_zone: i32,
     /// Advertised video width.
     pub width: u32,
     /// Advertised video height.
@@ -104,6 +106,10 @@ struct Opt {
     /// Answer pings with a 400, as some cameras do
     #[arg(long)]
     refuse_pings: bool,
+    /// The camera's time zone, in seconds west of UTC as Reolink counts:
+    /// -3600 for UTC+1
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    time_zone: i32,
     /// Annex-B H.264 file to loop instead of the built-in test pattern
     #[arg(long)]
     h264: Option<PathBuf>,
@@ -147,6 +153,7 @@ async fn main() -> Result<()> {
         fps: opt.fps,
         claimed_fps: opt.claimed_fps.unwrap_or(opt.fps),
         refuse_pings: opt.refuse_pings,
+        time_zone: opt.time_zone,
         width: opt.width,
         height: opt.height,
     });

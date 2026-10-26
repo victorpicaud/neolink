@@ -68,7 +68,7 @@ jobs:
             libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-libav \
-            protobuf-compiler libssl-dev
+            protobuf-compiler libssl-dev ffmpeg
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -81,6 +81,10 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Test (no default features)
         run: cargo test --workspace --no-default-features
+      - name: Test fake camera
+        run: cargo test --manifest-path iso-test/sim/fakecam/Cargo.toml
+      - name: End-to-end smoke test (neolink rtsp <- fake camera)
+        run: bash iso-test/sim/smoke.sh
 
   check_deny:
     needs: pre_job

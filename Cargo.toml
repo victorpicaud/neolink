@@ -10,6 +10,11 @@ license = "AGPL-3.0-or-later"
 members = [
   "crates/*",
 ]
+# Test harnesses. Excluded so `cargo build` at the repo root (what the
+# Dockerfile runs) never compiles test-only code into the shipped binary.
+exclude = [
+  "iso-test/sim/fakecam",
+]
 
 [dependencies]
 anyhow = "1.0.70"

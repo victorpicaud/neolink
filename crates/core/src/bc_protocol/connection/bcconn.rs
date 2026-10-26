@@ -6,8 +6,16 @@ use futures::stream::{Stream, StreamExt};
 use log::*;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use tokio::sync::mpsc::{channel, Sender};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
+use tokio::sync::{
+    mpsc::{channel, Receiver, Sender},
+    oneshot,
+};
+use tokio::task::JoinHandle;
+use tokio::time::{timeout, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
@@ -15,15 +23,131 @@ use tokio::{sync::RwLock, task::JoinSet};
 
 type MsgHandler = dyn 'static + Send + Sync + for<'a> Fn(&'a Bc) -> BoxFuture<'a, Option<Bc>>;
 
+/// How many messages a request/reply subscription holds before it overflows
+const REPLY_CAPACITY: usize = 100;
+/// How many camera-initiated messages wait for their handler
+const HANDLER_CAPACITY: usize = 20;
+/// How long `shutdown` waits for what is queued, like a logout, to go out
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What a subscription does when its subscriber falls behind and its queue is
+/// full
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overflow {
+    /// End the subscription with [`Error::SubscriptionOverflow`]: for replies,
+    /// and for streams where a gap would corrupt whatever comes after it
+    Close,
+    /// Drop the new message: for events that a later one supersedes
+    DropNewest,
+}
+
+/// Where the messages for one subscriber go
+struct Route {
+    tx: Sender<Result<Bc>>,
+    overflow: Overflow,
+    /// Tells routes apart, so that a handler's guard removes its own route
+    /// and never a newer one for the same message
+    id: u64,
+}
+
+impl Route {
+    /// Hands a message over without ever waiting, so that a subscriber that
+    /// fell behind cannot hold up the messages for every other one, pings
+    /// included. Returns false once the route is gone.
+    fn deliver(&self, bc: Bc) -> bool {
+        let msg_id = bc.meta.msg_id;
+        // The last slot is kept for the error that ends the subscription
+        if self.tx.capacity() > 1 {
+            return self.tx.try_send(Ok(bc)).is_ok();
+        }
+        match self.overflow {
+            Overflow::DropNewest => {
+                debug!("A handler of message {msg_id} is behind, dropping a message");
+                !self.tx.is_closed()
+            }
+            Overflow::Close => {
+                warn!("A subscriber to message {msg_id} fell behind, ending its subscription");
+                self.fail(Error::SubscriptionOverflow { msg_id });
+                false
+            }
+        }
+    }
+
+    /// Ends the subscription with an error, in the slot kept for it
+    fn fail(&self, error: Error) {
+        let _ = self.tx.try_send(Err(error));
+    }
+}
+
 #[derive(Default)]
-struct Subscriber {
-    /// Subscribers based on their ID and their num
-    /// First filtered by ID then number
-    /// If num is None it will be upgraded to a Some based on the number the
-    /// camera assigns
-    num: BTreeMap<u32, BTreeMap<Option<u16>, Sender<Result<Bc>>>>,
-    /// Subscribers based on their ID
-    id: BTreeMap<u32, Arc<MsgHandler>>,
+struct Routes {
+    /// Replies and streams, by message ID then number. A route without a
+    /// number yet takes the number of the first message it gets.
+    num: BTreeMap<u32, BTreeMap<Option<u16>, Route>>,
+    /// Messages the camera starts, by message ID whatever their number: to a
+    /// handler, or to an event subscription
+    id: BTreeMap<u32, Route>,
+}
+
+impl Routes {
+    /// Forgets the routes whose subscriber is gone
+    fn prune(&mut self) {
+        for routes in self.num.values_mut() {
+            routes.retain(|_, route| !route.tx.is_closed());
+        }
+        self.num.retain(|_, routes| !routes.is_empty());
+        self.id.retain(|_, route| !route.tx.is_closed());
+    }
+
+    fn deliver(&mut self, bc: Bc) {
+        let msg_id = bc.meta.msg_id;
+        let msg_num = bc.meta.msg_num;
+        if let Some(route) = self.id.get(&msg_id) {
+            if !route.deliver(bc) {
+                self.id.remove(&msg_id);
+            }
+            return;
+        }
+        let Some(routes) = self.num.get_mut(&msg_id) else {
+            trace!("Ignoring uninteresting message id {msg_id} (number: {msg_num})");
+            return;
+        };
+        // A route waiting for its number takes this one
+        if !routes.contains_key(&Some(msg_num)) {
+            if let Some(route) = routes.remove(&None) {
+                routes.insert(Some(msg_num), route);
+            }
+        }
+        match routes.get(&Some(msg_num)) {
+            Some(route) => {
+                if !route.deliver(bc) {
+                    routes.remove(&Some(msg_num));
+                }
+            }
+            None => trace!("Ignoring uninteresting message id {msg_id} (number: {msg_num})"),
+        }
+    }
+
+    /// Tells every subscriber, without waiting on any of them
+    fn fail_all(&mut self, error: &Error) {
+        for route in self
+            .num
+            .values()
+            .flat_map(|routes| routes.values())
+            .chain(self.id.values())
+        {
+            route.fail(error.clone());
+        }
+        self.num.clear();
+        self.id.clear();
+    }
+}
+
+/// What the writer task sends to the camera
+enum Outgoing {
+    Bc(Box<Bc>),
+    /// Answered once everything queued before it has been written
+    Flush(oneshot::Sender<()>),
 }
 
 pub(crate) type BcConnSink = Box<dyn Sink<Bc, Error = Error> + Send + Sync + Unpin>;
@@ -35,21 +159,23 @@ pub(crate) type BcConnSource = Box<dyn Stream<Item = Result<Bc>> + Send + Sync +
 ///
 /// There can be only one subscriber per kind of message at a time.
 pub struct BcConnection {
-    sink: Sender<Result<Bc>>,
+    sink: Sender<Outgoing>,
     poll_commander: Sender<PollCommand>,
     rx_thread: RwLock<JoinSet<Result<()>>>,
     cancel: CancellationToken,
+    /// Set by `shutdown`: nothing new may be sent from then on
+    closing: AtomicBool,
+    next_route_id: AtomicU64,
 }
 
 impl BcConnection {
     pub async fn new(mut sink: BcConnSink, mut source: BcConnSource) -> Result<BcConnection> {
-        let (sinker, sinker_rx) = channel::<Result<Bc>>(100);
+        let (sinker, mut sinker_rx) = channel::<Outgoing>(100);
         let cancel = CancellationToken::new();
 
         let (poll_commander, poll_commanded) = channel(200);
         let mut poller = Poller {
-            subscribers: Default::default(),
-            sink: sinker.clone(),
+            routes: Default::default(),
             reciever: ReceiverStream::new(poll_commanded),
         };
 
@@ -66,7 +192,12 @@ impl BcConnection {
                     while let Some(bc) = source.next().await {
                         sender.send(PollCommand::Bc(Box::new(bc))).await?;
                     }
-                    Result::Ok(())
+                    // The camera closed the connection. Ending quietly here
+                    // left every request waiting forever (#229).
+                    let _ = sender
+                        .send(PollCommand::Bc(Box::new(Err(Error::DroppedConnection))))
+                        .await;
+                    Err(Error::DroppedConnection)
                 } => v
             }
         });
@@ -76,9 +207,13 @@ impl BcConnection {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
                 v = async {
-                    let mut stream = ReceiverStream::new(sinker_rx);
-                    while let Some(packet) = stream.next().await {
-                        sink.send(packet?).await?;
+                    while let Some(outgoing) = sinker_rx.recv().await {
+                        match outgoing {
+                            Outgoing::Bc(bc) => sink.send(*bc).await?,
+                            Outgoing::Flush(done) => {
+                                let _ = done.send(());
+                            }
+                        }
                     }
                     Ok(())
                 } => v
@@ -104,18 +239,46 @@ impl BcConnection {
             poll_commander,
             rx_thread: RwLock::new(rx_thread),
             cancel,
+            closing: AtomicBool::new(false),
+            next_route_id: AtomicU64::new(0),
         })
     }
 
     pub(super) async fn send(&self, bc: Bc) -> crate::Result<()> {
-        self.sink.send(Ok(bc)).await?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Error::ConnectionShutdown);
+        }
+        self.sink.send(Outgoing::Bc(Box::new(bc))).await?;
         Ok(())
     }
 
+    /// A route for a new subscriber, and the queue it reads
+    fn new_route(&self, capacity: usize, overflow: Overflow) -> (Route, Receiver<Result<Bc>>) {
+        // One slot more than asked for, kept for the error that ends it
+        let (tx, rx) = channel(capacity + 1);
+        let id = self.next_route_id.fetch_add(1, Ordering::Relaxed);
+        (Route { tx, overflow, id }, rx)
+    }
+
+    /// Subscribes to the replies to a request. The subscription ends with
+    /// [`Error::SubscriptionOverflow`] if 100 of them go unread.
     pub async fn subscribe(&self, msg_id: u32, msg_num: u16) -> Result<BcSubscription<'_>> {
-        let (tx, rx) = channel(100);
+        self.subscribe_opts(msg_id, msg_num, REPLY_CAPACITY, Overflow::Close)
+            .await
+    }
+
+    /// Subscribes to the messages with this ID and number, holding up to
+    /// `capacity` unread ones before `overflow` applies
+    pub async fn subscribe_opts(
+        &self,
+        msg_id: u32,
+        msg_num: u16,
+        capacity: usize,
+        overflow: Overflow,
+    ) -> Result<BcSubscription<'_>> {
+        let (route, rx) = self.new_route(capacity, overflow);
         self.poll_commander
-            .send(PollCommand::AddSubscriber(msg_id, Some(msg_num), tx))
+            .send(PollCommand::AddSubscriber(msg_id, Some(msg_num), route))
             .await?;
         Ok(BcSubscription::new(rx, Some(msg_num as u32), self))
     }
@@ -123,23 +286,50 @@ impl BcConnection {
     /// Some messages are initiated by the camera. This creates a handler for them
     /// It requires a closure that will be used to handle the message
     /// and return either None or Some(Bc) reply
-    pub async fn handle_msg<T>(&self, msg_id: u32, handler: T) -> Result<()>
+    ///
+    /// The handler stays until the returned guard is dropped. A message can
+    /// only have one handler at a time: registering a second one is an error.
+    pub async fn handle_msg<T>(&self, msg_id: u32, handler: T) -> Result<MsgHandlerGuard>
     where
         T: 'static + Send + Sync + for<'a> Fn(&'a Bc) -> BoxFuture<'a, Option<Bc>>,
     {
-        self.poll_commander
-            .send(PollCommand::AddHandler(msg_id, Arc::new(handler)))
-            .await?;
-        Ok(())
+        let handler: Arc<MsgHandler> = Arc::new(handler);
+        let (route, mut rx) = self.new_route(HANDLER_CAPACITY, Overflow::DropNewest);
+        let route_id = route.id;
+        self.add_id_route(msg_id, route).await?;
+
+        // One worker per message ID handles them in the order they came.
+        // A task per message used to pile up, unbounded, behind a slow
+        // handler.
+        let sink = self.sink.clone();
+        let worker = tokio::task::spawn(async move {
+            while let Some(Ok(bc)) = rx.recv().await {
+                if let Some(reply) = handler(&bc).await {
+                    debug_assert_eq!(reply.meta.msg_num, bc.meta.msg_num);
+                    if sink.send(Outgoing::Bc(Box::new(reply))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(MsgHandlerGuard {
+            msg_id,
+            route_id,
+            poll_commander: self.poll_commander.clone(),
+            worker: Some(worker),
+        })
     }
 
-    /// Stop a message handler created using [`handle_msg`]
-    #[allow(dead_code)] // Currently unused but added for future use
-    pub async fn unhandle_msg(&self, msg_id: u32) -> Result<()> {
+    async fn add_id_route(&self, msg_id: u32, route: Route) -> Result<()> {
+        let (reply, added) = oneshot::channel();
         self.poll_commander
-            .send(PollCommand::RemoveHandler(msg_id))
+            .send(PollCommand::AddIdRoute {
+                msg_id,
+                route,
+                reply,
+            })
             .await?;
-        Ok(())
+        added.await.map_err(|_| Error::DroppedConnection)?
     }
 
     /// Some times we want to wait for a reply on a new message ID
@@ -149,12 +339,29 @@ impl BcConnection {
     /// The command Snap that grabs a jpeg payload is an example of this
     ///
     /// This function creates a temporary handle to grab this single message
-    pub async fn subscribe_to_id(&self, msg_id: u32) -> Result<BcSubscription<'_>> {
-        let (tx, rx) = channel(100);
+    pub async fn subscribe_to_id(
+        &self,
+        msg_id: u32,
+        capacity: usize,
+    ) -> Result<BcSubscription<'_>> {
+        let (route, rx) = self.new_route(capacity, Overflow::Close);
         self.poll_commander
-            .send(PollCommand::AddSubscriber(msg_id, None, tx))
+            .send(PollCommand::AddSubscriber(msg_id, None, route))
             .await?;
         Ok(BcSubscription::new(rx, None, self))
+    }
+
+    /// Subscribes to every message with this ID, whatever its number, such as
+    /// the motion alarms the camera sends. A subscription by ID with
+    /// [`Self::subscribe_to_id`] only sees the number of its first message.
+    pub async fn subscribe_events(
+        &self,
+        msg_id: u32,
+        capacity: usize,
+    ) -> Result<BcSubscription<'_>> {
+        let (route, rx) = self.new_route(capacity, Overflow::Close);
+        self.add_id_route(msg_id, route).await?;
+        Ok(BcSubscription::new_events(rx, self))
     }
 
     pub(crate) async fn join(&self) -> Result<()> {
@@ -176,7 +383,18 @@ impl BcConnection {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        let _ = self.poll_commander.send(PollCommand::Disconnect).await;
+        // Refuse anything new, but let what is already queued, such as a
+        // logout, go out first. Cancelling at once used to drop it.
+        self.closing.store(true, Ordering::Release);
+        let (flushed, written) = oneshot::channel();
+        let _ = timeout(FLUSH_TIMEOUT, async {
+            if self.sink.send(Outgoing::Flush(flushed)).await.is_ok() {
+                let _ = written.await;
+            }
+        })
+        .await;
+        // Never wait on a full command queue
+        let _ = self.poll_commander.try_send(PollCommand::Disconnect);
         self.cancel.cancel();
         let mut locked_threads = self.rx_thread.write().await;
         while locked_threads.join_next().await.is_some() {}
@@ -200,11 +418,48 @@ impl Drop for BcConnection {
     }
 }
 
+/// Keeps a handler made with [`BcConnection::handle_msg`]. Dropping it removes
+/// the handler, so that the message can be handled anew.
+pub struct MsgHandlerGuard {
+    msg_id: u32,
+    route_id: u64,
+    poll_commander: Sender<PollCommand>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl MsgHandlerGuard {
+    /// Keeps the handler for as long as the connection lasts
+    pub fn forever(mut self) {
+        // Detached: dropping the handle leaves the worker running
+        self.worker.take();
+    }
+}
+
+impl Drop for MsgHandlerGuard {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+            // Queued, so it comes before any registration made after this
+            let _ = self.poll_commander.try_send(PollCommand::RemoveIdRoute {
+                msg_id: self.msg_id,
+                route_id: self.route_id,
+            });
+        }
+    }
+}
+
 enum PollCommand {
     Bc(Box<Result<Bc>>),
-    AddHandler(u32, Arc<MsgHandler>),
-    RemoveHandler(u32),
-    AddSubscriber(u32, Option<u16>, Sender<Result<Bc>>),
+    AddSubscriber(u32, Option<u16>, Route),
+    AddIdRoute {
+        msg_id: u32,
+        route: Route,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    RemoveIdRoute {
+        msg_id: u32,
+        route_id: u64,
+    },
     Disconnect,
 }
 
@@ -212,188 +467,76 @@ impl std::fmt::Debug for PollCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PollCommand::Bc(_) => f.write_str("PollCommand::Bc"),
-            PollCommand::AddHandler(_, _) => f.write_str("PollCommand::AddHandler"),
-            PollCommand::RemoveHandler(_) => f.write_str("PollCommand::RemoveHandler"),
             PollCommand::AddSubscriber(_, _, _) => f.write_str("PollCommand::AddSubscriber"),
+            PollCommand::AddIdRoute { .. } => f.write_str("PollCommand::AddIdRoute"),
+            PollCommand::RemoveIdRoute { .. } => f.write_str("PollCommand::RemoveIdRoute"),
             PollCommand::Disconnect => f.write_str("PollCommand::Disconnect"),
         }
     }
 }
 
 struct Poller {
-    subscribers: Subscriber,
-    sink: Sender<Result<Bc>>,
+    routes: Routes,
     reciever: ReceiverStream<PollCommand>,
 }
 
 impl Poller {
     async fn run(&mut self) -> Result<()> {
-        let cancel = CancellationToken::new();
-        let _dropguard = cancel.clone().drop_guard();
         while let Some(command) = self.reciever.next().await {
-            // Clean Up subscribers
-            self.subscribers
-                .num
-                .iter_mut()
-                .for_each(|(_, channels)| channels.retain(|_, channel| !channel.is_closed()));
-            self.subscribers
-                .num
-                .retain(|_, channels| !channels.is_empty());
-            // Handle the command
+            self.routes.prune();
             match command {
-                PollCommand::Bc(boxed_response) => {
-                    match *boxed_response {
-                        Ok(response) => {
-                            let msg_id = response.meta.msg_id;
-                            let msg_num = response.meta.msg_num;
-                            log::trace!(
-                                "Looking for ID: {} with num: {}, in {:?} and {:?}",
-                                msg_id,
-                                msg_num,
-                                self.subscribers.id.keys().to_owned(),
-                                self.subscribers
-                                    .num
-                                    .iter()
-                                    .map(|(k, v)| (k, v.keys()))
-                                    .collect::<Vec<_>>(),
-                            );
-                            match (
-                                self.subscribers.id.get(&msg_id),
-                                self.subscribers.num.get_mut(&msg_id), // Both filter first on ID
-                            ) {
-                                (Some(occ), _) => {
-                                    log::trace!("Calling ID callback");
-                                    let occ = occ.clone();
-                                    let sink = self.sink.clone();
-                                    // Move this on another thread coz I have NO idea
-                                    // how long the callback will run for
-                                    // and we must NOT hang
-                                    let cancel = cancel.clone();
-                                    tokio::task::spawn(async move {
-                                        tokio::select! {
-                                            _ = cancel.cancelled() => Result::Ok(()),
-                                            v = occ(&response) => {
-                                                if let Some(reply) = v {
-                                                    assert!(reply.meta.msg_num == response.meta.msg_num);
-                                                    sink.send(Ok(reply)).await?;
-                                                }
-                                                Result::Ok(())
-                                            }
-                                        }
-                                    });
-                                    log::trace!("Called ID callback");
-                                }
-                                (None, Some(occ)) => {
-                                    let sender = if let Some(sender) =
-                                        occ.get(&Some(msg_num)).filter(|a| !a.is_closed()).cloned()
-                                    {
-                                        // Connection with id exists and is not closed
-                                        Some(sender)
-                                    } else if let Some(sender) = occ.get(&None).cloned() {
-                                        // Upgrade a None to a known MsgID
-                                        occ.remove(&None);
-                                        occ.insert(Some(msg_num), sender.clone());
-                                        Some(sender)
-                                    } else if occ
-                                        .get(&Some(msg_num))
-                                        .map(|a| a.is_closed())
-                                        .unwrap_or(false)
-                                    {
-                                        // Connection is closed and there is no None to replace it
-                                        // Remove it for cleanup and report no sender
-                                        occ.remove(&Some(msg_num));
-                                        None
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(sender) = sender {
-                                        if sender.capacity() == 0 {
-                                            warn!("Reaching limit of channel");
-                                            warn!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
-                                                msg_num,
-                                                msg_id
-                                            );
-                                        } else {
-                                            trace!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
-                                                msg_num,
-                                                msg_id
-                                            );
-                                        }
-                                        let _ = sender.send(Ok(response)).await;
-                                    } else {
-                                        trace!(
-                                            "Ignoring uninteresting message id {} (number: {})",
-                                            msg_id,
-                                            msg_num
-                                        );
-                                        trace!("Contents: {:?}", response);
-                                    }
-                                }
-                                (None, None) => {
-                                    trace!(
-                                        "Ignoring uninteresting message id {} (number: {})",
-                                        msg_id,
-                                        msg_num
-                                    );
-                                    trace!("Contents: {:?}", response);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            for sub in self.subscribers.num.values() {
-                                for sender in sub.values() {
-                                    let _ = sender.send(Err(e.clone())).await;
-                                }
-                            }
-                            self.subscribers.num.clear();
-                            self.subscribers.id.clear();
-                            return Err(e);
-                        }
+                PollCommand::Bc(boxed_response) => match *boxed_response {
+                    Ok(response) => self.routes.deliver(response),
+                    Err(e) => {
+                        self.routes.fail_all(&e);
+                        return Err(e);
                     }
-                }
-                PollCommand::AddHandler(msg_id, handler) => {
-                    match self.subscribers.id.entry(msg_id) {
+                },
+                PollCommand::AddSubscriber(msg_id, msg_num, route) => {
+                    match self.routes.num.entry(msg_id).or_default().entry(msg_num) {
                         Entry::Vacant(vac_entry) => {
-                            vac_entry.insert(handler);
+                            vac_entry.insert(route);
+                        }
+                        Entry::Occupied(mut occ_entry) if occ_entry.get().tx.is_closed() => {
+                            occ_entry.insert(route);
                         }
                         Entry::Occupied(_) => {
-                            return Err(Error::SimultaneousSubscriptionId { msg_id });
+                            route.fail(Error::SimultaneousSubscription { msg_num });
                         }
                     };
                 }
-                PollCommand::RemoveHandler(msg_id) => {
-                    self.subscribers.id.remove(&msg_id);
-                }
-                PollCommand::AddSubscriber(msg_id, msg_num, tx) => {
-                    match self
-                        .subscribers
-                        .num
-                        .entry(msg_id)
-                        .or_default()
-                        .entry(msg_num)
-                    {
+                PollCommand::AddIdRoute {
+                    msg_id,
+                    route,
+                    reply,
+                } => {
+                    let added = match self.routes.id.entry(msg_id) {
                         Entry::Vacant(vac_entry) => {
-                            vac_entry.insert(tx);
+                            vac_entry.insert(route);
+                            Ok(())
                         }
-                        Entry::Occupied(mut occ_entry) => {
-                            if occ_entry.get().is_closed() {
-                                occ_entry.insert(tx);
-                            } else {
-                                // log::error!("Failed to subscribe in bcconn to {:?} for {:?}", msg_num, msg_id);
-                                let _ = tx
-                                    .send(Err(Error::SimultaneousSubscription { msg_num }))
-                                    .await;
-                            }
+                        Entry::Occupied(mut occ_entry) if occ_entry.get().tx.is_closed() => {
+                            occ_entry.insert(route);
+                            Ok(())
                         }
+                        // The caller hears of it. This used to end polling,
+                        // and with it the connection.
+                        Entry::Occupied(_) => Err(Error::SimultaneousSubscriptionId { msg_id }),
                     };
+                    let _ = reply.send(added);
+                }
+                PollCommand::RemoveIdRoute { msg_id, route_id } => {
+                    if self
+                        .routes
+                        .id
+                        .get(&msg_id)
+                        .is_some_and(|route| route.id == route_id)
+                    {
+                        self.routes.id.remove(&msg_id);
+                    }
                 }
                 PollCommand::Disconnect => {
+                    self.routes.fail_all(&Error::ConnectionShutdown);
                     return Err(Error::ConnectionShutdown);
                 }
             }
@@ -405,18 +548,18 @@ impl Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::FutureExt;
     use std::time::Duration;
+    use tokio_util::sync::PollSender;
 
     /// `Poller::run` returns `Ok` as soon as its command channel is closed.
     /// The task driving it must therefore not call it again in a loop, or it
     /// spins without ever yielding.
     #[tokio::test]
     async fn poller_run_returns_once_commands_close() {
-        let (sink, _sink_rx) = channel::<Result<Bc>>(1);
         let (commander, commanded) = channel::<PollCommand>(1);
         let mut poller = Poller {
-            subscribers: Default::default(),
-            sink,
+            routes: Default::default(),
             reciever: ReceiverStream::new(commanded),
         };
         drop(commander);
@@ -424,5 +567,181 @@ mod tests {
             .await
             .expect("Poller::run did not return after its commands closed");
         assert!(result.is_ok());
+    }
+
+    /// A connection to a pretend camera: what the camera sends goes in
+    /// through the first channel, what neolink sends comes out of the second
+    async fn connection(writes: usize) -> (BcConnection, Sender<Result<Bc>>, Receiver<Bc>) {
+        let (camera_tx, camera_rx) = channel(100);
+        let (written_tx, written_rx) = channel(writes);
+        let sink = PollSender::new(written_tx).sink_map_err(|_| Error::DroppedConnection);
+        let connection =
+            BcConnection::new(Box::new(sink), Box::new(ReceiverStream::new(camera_rx)))
+                .await
+                .unwrap();
+        (connection, camera_tx, written_rx)
+    }
+
+    fn msg(msg_id: u32, msg_num: u16) -> Bc {
+        Bc {
+            meta: BcMeta {
+                msg_id,
+                channel_id: 0,
+                msg_num,
+                stream_type: 0,
+                response_code: 200,
+                class: 0x0000,
+            },
+            body: BcBody::ModernMsg(ModernMsg::default()),
+        }
+    }
+
+    async fn soon<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(2), future)
+            .await
+            .expect("this should not wait")
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_that_falls_behind_holds_up_no_one_else() {
+        let (connection, camera, _written) = connection(10).await;
+        let mut video = connection
+            .subscribe_opts(MSG_ID_VIDEO, 1, 2, Overflow::Close)
+            .await
+            .unwrap();
+        let mut ping = connection.subscribe(MSG_ID_PING, 2).await.unwrap();
+
+        for _ in 0..10 {
+            camera.send(Ok(msg(MSG_ID_VIDEO, 1))).await.unwrap();
+        }
+        camera.send(Ok(msg(MSG_ID_PING, 2))).await.unwrap();
+
+        // The ping gets through although the video was never read
+        assert!(soon(ping.recv()).await.is_ok());
+        // And the video subscription ends after what it could hold
+        assert!(soon(video.recv()).await.is_ok());
+        assert!(soon(video.recv()).await.is_ok());
+        assert!(matches!(
+            soon(video.recv()).await,
+            Err(Error::SubscriptionOverflow {
+                msg_id: MSG_ID_VIDEO
+            })
+        ));
+
+        // Only that one route closed
+        camera.send(Ok(msg(MSG_ID_PING, 2))).await.unwrap();
+        assert!(soon(ping.recv()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_reaches_every_waiter() {
+        let (connection, camera, _written) = connection(10).await;
+        let mut first = connection.subscribe(MSG_ID_PING, 1).await.unwrap();
+        let mut second = connection.subscribe(MSG_ID_VERSION, 2).await.unwrap();
+
+        // The camera closes the connection (TCP FIN)
+        drop(camera);
+
+        assert!(matches!(
+            soon(first.recv()).await,
+            Err(Error::DroppedConnection)
+        ));
+        assert!(matches!(
+            soon(second.recv()).await,
+            Err(Error::DroppedConnection)
+        ));
+        assert!(soon(connection.join()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_what_is_queued_first() {
+        let (connection, _camera, mut written) = connection(10).await;
+        connection.send(msg(MSG_ID_LOGOUT, 1)).await.unwrap();
+
+        soon(connection.shutdown()).await.unwrap();
+
+        assert_eq!(written.recv().await.unwrap().meta.msg_id, MSG_ID_LOGOUT);
+        assert!(matches!(
+            connection.send(msg(MSG_ID_PING, 2)).await,
+            Err(Error::ConnectionShutdown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_even_if_the_camera_takes_nothing() {
+        // Nothing reads what neolink writes, so its queue stays full
+        let (connection, _camera, _written) = connection(1).await;
+        for num in 0..50 {
+            connection.send(msg(MSG_ID_PING, num)).await.unwrap();
+        }
+
+        tokio::time::timeout(
+            FLUSH_TIMEOUT + Duration::from_secs(1),
+            connection.shutdown(),
+        )
+        .await
+        .expect("shutdown waited on the camera for good")
+        .unwrap();
+    }
+
+    fn ignore(_: &Bc) -> BoxFuture<'_, Option<Bc>> {
+        async { None }.boxed()
+    }
+
+    #[tokio::test]
+    async fn a_handler_is_unique_until_its_guard_is_dropped() {
+        let (connection, camera, _written) = connection(10).await;
+        let guard = connection.handle_msg(MSG_ID_MOTION, ignore).await.unwrap();
+
+        // A second one is refused, without ending the connection
+        assert!(matches!(
+            connection.handle_msg(MSG_ID_MOTION, ignore).await,
+            Err(Error::SimultaneousSubscriptionId { .. })
+        ));
+        let mut ping = connection.subscribe(MSG_ID_PING, 1).await.unwrap();
+        camera.send(Ok(msg(MSG_ID_PING, 1))).await.unwrap();
+        assert!(soon(ping.recv()).await.is_ok());
+
+        // And accepted once the first is gone
+        drop(guard);
+        assert!(connection.handle_msg(MSG_ID_MOTION, ignore).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_handler_answers_the_camera() {
+        let (connection, camera, mut written) = connection(10).await;
+        connection
+            .handle_msg(MSG_ID_UDP_KEEP_ALIVE, |bc| {
+                let reply = msg(MSG_ID_UDP_KEEP_ALIVE, bc.meta.msg_num);
+                async move { Some(reply) }.boxed()
+            })
+            .await
+            .unwrap()
+            .forever();
+
+        for num in 0..3 {
+            camera
+                .send(Ok(msg(MSG_ID_UDP_KEEP_ALIVE, num)))
+                .await
+                .unwrap();
+        }
+        for num in 0..3 {
+            assert_eq!(soon(written.recv()).await.unwrap().meta.msg_num, num);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_subscription_sees_every_message_number() {
+        let (connection, camera, _written) = connection(10).await;
+        let mut events = connection
+            .subscribe_events(MSG_ID_MOTION, 10)
+            .await
+            .unwrap();
+
+        camera.send(Ok(msg(MSG_ID_MOTION, 7))).await.unwrap();
+        camera.send(Ok(msg(MSG_ID_MOTION, 8))).await.unwrap();
+
+        assert_eq!(soon(events.recv()).await.unwrap().meta.msg_num, 7);
+        assert_eq!(soon(events.recv()).await.unwrap().meta.msg_num, 8);
     }
 }

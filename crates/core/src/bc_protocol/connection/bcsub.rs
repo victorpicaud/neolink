@@ -13,6 +13,8 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 pub struct BcSubscription<'a> {
     rx: ReceiverStream<Result<Bc>>,
     msg_num: Option<u32>,
+    /// Gets every message with its ID, whatever their numbers
+    events: bool,
     conn: &'a BcConnection,
 }
 
@@ -44,6 +46,17 @@ impl<'a> BcSubscription<'a> {
         BcSubscription {
             rx: ReceiverStream::new(rx),
             msg_num,
+            events: false,
+            conn,
+        }
+    }
+
+    /// A subscription to every message with an ID, whatever their numbers
+    pub fn new_events(rx: Receiver<Result<Bc>>, conn: &'a BcConnection) -> BcSubscription<'a> {
+        BcSubscription {
+            rx: ReceiverStream::new(rx),
+            msg_num: None,
+            events: true,
             conn,
         }
     }
@@ -60,6 +73,9 @@ impl<'a> BcSubscription<'a> {
 
     pub async fn recv(&mut self) -> Result<Bc> {
         let bc = self.rx.next().await.ok_or(Error::DroppedSubscriber)?;
+        if self.events {
+            return bc;
+        }
         if let Ok(bc) = &bc {
             if let Some(msg_num) = self.msg_num {
                 assert!(bc.meta.msg_num as u32 == msg_num);

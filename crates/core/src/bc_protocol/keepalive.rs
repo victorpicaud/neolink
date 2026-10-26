@@ -26,7 +26,8 @@ impl BcCamera {
                     })
                 })
             })
-            .await?;
+            .await?
+            .forever();
         Ok(())
     }
 }

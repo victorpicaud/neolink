@@ -1,11 +1,13 @@
-use super::{BcCamera, Error, Result};
+use super::{BcCamera, Error, Overflow, Result};
 use crate::{
     bc::{model::*, xml::*},
     bcmedia::model::*,
 };
+use futures::stream::Stream;
 use futures::stream::StreamExt;
-use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender};
 use tokio::task::{self, JoinHandle};
+use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
 /// The stream names supported by BC
@@ -31,6 +33,12 @@ impl std::fmt::Display for StreamKind {
         }
     }
 }
+
+/// How many video messages may wait unread. Video arrives fast, so this is
+/// longer than for a reply.
+const VIDEO_CAPACITY: usize = 512;
+/// How long stopping a stream may take before it is given up on
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A handle on currently streaming data
 ///
@@ -91,6 +99,38 @@ impl Drop for StreamData {
     }
 }
 
+/// Hands the media to the app without ever waiting on it, so that the
+/// camera's messages are always read and its queue never fills. While the app
+/// is behind, frames are dropped; video then resumes at the next keyframe, so
+/// a decoder never sees a P-frame without the frames it depends on.
+async fn forward_media<S>(media: &mut S, tx: &Sender<Result<BcMedia>>)
+where
+    S: Stream<Item = Result<BcMedia>> + Unpin,
+{
+    let mut need_keyframe = false;
+    while let Some(media) = media.next().await {
+        if media.is_err() {
+            // The stream is over, which is worth waiting to hand over
+            let _ = tx.send(media).await;
+            return;
+        }
+        let keyframe = matches!(media, Ok(BcMedia::Iframe(_)));
+        let video = keyframe || matches!(media, Ok(BcMedia::Pframe(_)));
+        if need_keyframe && video && !keyframe {
+            continue;
+        }
+        match tx.try_send(media) {
+            Ok(()) if keyframe => need_keyframe = false,
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                log::trace!("The stream's reader is behind, dropping media");
+                need_keyframe |= video;
+            }
+            Err(TrySendError::Closed(_)) => return,
+        }
+    }
+}
+
 impl BcCamera {
     ///
     /// Starts the video stream
@@ -130,7 +170,12 @@ impl BcCamera {
         let channel_id = self.channel_id;
 
         let handle = task::spawn(async move {
-            let mut sub_video = connection.subscribe(MSG_ID_VIDEO, msg_num).await?;
+            // If the queue still fills, the subscription ends and the stream
+            // restarts cleanly at a keyframe. Dropping messages instead would
+            // splice the frames they carry together.
+            let mut sub_video = connection
+                .subscribe_opts(MSG_ID_VIDEO, msg_num, VIDEO_CAPACITY, Overflow::Close)
+                .await?;
 
             // On an E1 and swann cameras:
             //  - mainStream always has a value of 0
@@ -207,16 +252,12 @@ impl BcCamera {
 
                 tokio::select! {
                     _ = abort_handle_thread.cancelled() => {},
-                    _ = async {
-                        while let Some(bc_media) = media_sub.next().await {
-                            // We now have a complete interesting packet. Send it to on the callback
-                            if tx.send(bc_media).await.is_err() {
-                                break; // Connection dropped
-                            }
-                        }
-                    } => {}
+                    _ = forward_media(&mut media_sub, &tx) => {}
                 }
             }
+            // Stop listening, or the video that keeps coming while the camera
+            // stops would queue up for no one
+            drop(sub_video);
 
             let stop_video = Bc::new_from_xml(
                 BcMeta {
@@ -237,33 +278,33 @@ impl BcCamera {
                     ..Default::default()
                 },
             );
-            let mut sub_stop = connection.subscribe(MSG_ID_VIDEO_STOP, msg_num).await?;
-            sub_stop.send(stop_video).await?;
-
-            tokio::select! {
-                v = async {
-                    loop {
-                        let msg = sub_stop.recv().await?;
-                        if let BcMeta {
-                            response_code: 200,
-                            msg_id: MSG_ID_VIDEO_STOP,
-                            ..
-                        } = msg.meta {
-                            return Ok(());
-                        }
-                        else if let BcMeta {
-                            msg_id: MSG_ID_VIDEO_STOP,
-                            ..
-                        }   = msg.meta {
-                            return Err(Error::CameraServiceUnavailable{
-                                id: msg.meta.msg_id,
-                                code: msg.meta.response_code,
-                            });
-                        }
+            let stopped = timeout(STOP_TIMEOUT, async {
+                let mut sub_stop = connection.subscribe(MSG_ID_VIDEO_STOP, msg_num).await?;
+                sub_stop.send(stop_video).await?;
+                loop {
+                    let msg = sub_stop.recv().await?;
+                    if let BcMeta {
+                        response_code: 200,
+                        msg_id: MSG_ID_VIDEO_STOP,
+                        ..
+                    } = msg.meta
+                    {
+                        return Ok(());
+                    } else if let BcMeta {
+                        msg_id: MSG_ID_VIDEO_STOP,
+                        ..
+                    } = msg.meta
+                    {
+                        return Err(Error::CameraServiceUnavailable {
+                            id: msg.meta.msg_id,
+                            code: msg.meta.response_code,
+                        });
                     }
-                } => v,
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {Ok(())},
-            }?;
+                }
+            })
+            .await;
+            // A camera that does not answer the stop has stopped all the same
+            stopped.unwrap_or(Ok(()))?;
 
             Ok(())
         });
@@ -352,6 +393,62 @@ impl BcCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bcmedia::model::{BcMediaIframe, BcMediaPframe, VideoType};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    fn iframe(n: u8) -> Result<BcMedia> {
+        Ok(BcMedia::Iframe(BcMediaIframe {
+            video_type: VideoType::H264,
+            microseconds: 0,
+            time: None,
+            data: vec![n],
+        }))
+    }
+
+    fn pframe(n: u8) -> Result<BcMedia> {
+        Ok(BcMedia::Pframe(BcMediaPframe {
+            video_type: VideoType::H264,
+            microseconds: 0,
+            data: vec![n],
+        }))
+    }
+
+    fn frame_number(media: Result<BcMedia>) -> u8 {
+        match media.unwrap() {
+            BcMedia::Iframe(BcMediaIframe { data, .. })
+            | BcMedia::Pframe(BcMediaPframe { data, .. }) => data[0],
+            _ => panic!("not video"),
+        }
+    }
+
+    #[tokio::test]
+    async fn video_resumes_at_a_keyframe_once_the_reader_catches_up() {
+        let (camera, from_camera) = channel(16);
+        let (to_app, mut app) = channel(2);
+        let forwarding = tokio::spawn(async move {
+            forward_media(&mut ReceiverStream::new(from_camera), &to_app).await
+        });
+
+        // The app reads nothing yet: 1 and 2 fit, 3 and 4 do not
+        for frame in [iframe(1), pframe(2), pframe(3), pframe(4)] {
+            camera.send(frame).await.unwrap();
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(frame_number(app.recv().await.unwrap()), 1);
+        assert_eq!(frame_number(app.recv().await.unwrap()), 2);
+
+        // With room again, 5 still depends on what was dropped, 6 does not
+        for frame in [pframe(5), iframe(6), pframe(7)] {
+            camera.send(frame).await.unwrap();
+        }
+        drop(camera);
+        forwarding.await.unwrap();
+        assert_eq!(frame_number(app.recv().await.unwrap()), 6);
+        assert_eq!(frame_number(app.recv().await.unwrap()), 7);
+        assert!(app.recv().await.is_none());
+    }
 
     #[tokio::test]
     async fn reading_past_the_end_of_a_stream_never_panics() {

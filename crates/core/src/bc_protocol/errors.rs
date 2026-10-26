@@ -170,6 +170,13 @@ pub enum Error {
     #[error("Dropped Subscriber")]
     DroppedSubscriber,
 
+    /// Raised when a subscriber fell so far behind that its queue filled up
+    #[error("Subscription to message {msg_id} fell behind and was ended")]
+    SubscriptionOverflow {
+        /// The message ID subscribed to
+        msg_id: u32,
+    },
+
     /// Raised when a unknown connection ID attempts to connect with us over UDP
     #[error("Connection with unknown connectionID: {0:?}")]
     UnknownConnectionId(i32),

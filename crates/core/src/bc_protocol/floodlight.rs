@@ -8,9 +8,10 @@ impl BcCamera {
     pub async fn listen_on_flightlight(&self) -> Result<Receiver<FloodlightStatusList>> {
         let (tx, rx) = channel(3);
         let connection = self.get_connection();
-        connection
+        let handler_tx = tx.clone();
+        let guard = connection
             .handle_msg(MSG_ID_FLOODLIGHT_STATUS_LIST, move |bc| {
-                let tx = tx.clone();
+                let tx = handler_tx.clone();
                 Box::pin(async move {
                     if let Bc {
                         meta:
@@ -36,6 +37,12 @@ impl BcCamera {
                 })
             })
             .await?;
+        // The handler lasts as long as someone listens. It used to stay for
+        // good, so listening again failed, and took the connection with it.
+        tokio::task::spawn(async move {
+            tx.closed().await;
+            drop(guard);
+        });
 
         Ok(rx)
     }

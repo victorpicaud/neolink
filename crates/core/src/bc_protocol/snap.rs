@@ -3,6 +3,9 @@
 use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 
+/// How many messages of image data may wait unread
+const SNAPSHOT_CAPACITY: usize = 256;
+
 impl BcCamera {
     /// Get the snapshot image
     pub async fn get_snapshot(&self) -> Result<Vec<u8>> {
@@ -69,7 +72,9 @@ impl BcCamera {
             //
             // This means we need to listen for the next 109 grab the message num and
             // subscribe to it. This is what `subscribe_to_next` is for
-            let mut sub_get = connection.subscribe_to_id(MSG_ID_SNAP).await?;
+            let mut sub_get = connection
+                .subscribe_to_id(MSG_ID_SNAP, SNAPSHOT_CAPACITY)
+                .await?;
             let expected_size = expected_size as usize;
 
             let mut result: Vec<_> = vec![];

@@ -2,6 +2,9 @@ use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, error::TryRecvError, Receiver};
+
+/// How many motion alarms may wait to be read
+const MOTION_CAPACITY: usize = 100;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -161,6 +164,52 @@ impl MotionData {
     }
 }
 
+/// The status to hand over next, when `status` arrives while `pending` still
+/// waits: the newer one, except that an alarm about something else does not
+/// hide a start or a stop
+fn supersede(
+    pending: Option<Result<MotionStatus>>,
+    status: Result<MotionStatus>,
+) -> Result<MotionStatus> {
+    match (pending, status) {
+        (
+            Some(Ok(kept @ (MotionStatus::Start(_) | MotionStatus::Stop(_)))),
+            Ok(MotionStatus::NoChange(_)),
+        ) => Ok(kept),
+        (_, status) => status,
+    }
+}
+
+/// What an alarm message says about motion on this channel
+fn motion_status(motion_msg: Bc, channel_id: u8) -> MotionStatus {
+    if let BcBody::ModernMsg(ModernMsg {
+        payload:
+            Some(BcPayloads::BcXml(BcXml {
+                alarm_event_list: Some(alarm_event_list),
+                ..
+            })),
+        ..
+    }) = motion_msg.body
+    {
+        for alarm_event in &alarm_event_list.alarm_events {
+            if alarm_event.channel_id == channel_id {
+                if alarm_event.status != "none"
+                    || alarm_event
+                        .ai_type
+                        .as_ref()
+                        .map(|ai_type| ai_type != "none")
+                        .unwrap_or(false)
+                {
+                    return MotionStatus::Start(Instant::now());
+                } else {
+                    return MotionStatus::Stop(Instant::now());
+                }
+            }
+        }
+    }
+    MotionStatus::NoChange(Instant::now())
+}
+
 impl BcCamera {
     /// This message tells the camera to send the motion events to us
     /// Which are the recieved on msgid 33
@@ -220,52 +269,32 @@ impl BcCamera {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
                 v = async {
-                    let mut sub = connection.subscribe_to_id(MSG_ID_MOTION).await?;
-
+                    // Every alarm, whatever its message number: a subscription
+                    // by ID only saw the number of the first one
+                    let mut sub = connection
+                        .subscribe_events(MSG_ID_MOTION, MOTION_CAPACITY)
+                        .await?;
+                    // The newest status not handed over yet. Reading never
+                    // waits on whoever takes the statuses, and the last one
+                    // they get is always the latest: a final Stop is not lost.
+                    let mut pending: Option<Result<MotionStatus>> = None;
                     loop {
-                        tokio::task::yield_now().await;
-                        let msg = sub.recv().await;
-                        let status = match msg {
-                            Ok(motion_msg) => {
-                                if let BcBody::ModernMsg(ModernMsg {
-                                    payload:
-                                        Some(BcPayloads::BcXml(BcXml {
-                                            alarm_event_list: Some(alarm_event_list),
-                                            ..
-                                        })),
-                                    ..
-                                }) = motion_msg.body
-                                {
-                                    let mut result = MotionStatus::NoChange(Instant::now());
-                                    for alarm_event in &alarm_event_list.alarm_events {
-                                        if alarm_event.channel_id == channel_id {
-                                            if alarm_event.status != "none"
-                                                || alarm_event
-                                                    .ai_type
-                                                    .as_ref()
-                                                    .map(|ai_type| ai_type != "none")
-                                                    .unwrap_or(false)
-                                            {
-                                                result = MotionStatus::Start(Instant::now());
-                                                break;
-                                            } else {
-                                                result = MotionStatus::Stop(Instant::now());
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Ok(result)
-                                } else {
-                                    Ok(MotionStatus::NoChange(Instant::now()))
+                        let ended = matches!(pending, Some(Err(_)));
+                        tokio::select! {
+                            msg = sub.recv(), if !ended => {
+                                let status = msg.map(|msg| motion_status(msg, channel_id));
+                                pending = Some(supersede(pending.take(), status));
+                            }
+                            permit = tx.reserve(), if pending.is_some() => {
+                                let Ok(permit) = permit else {
+                                    // Motion reciever has been dropped
+                                    break;
+                                };
+                                permit.send(pending.take().expect("pending was checked"));
+                                if ended {
+                                    break;
                                 }
                             }
-                            // On connection drop we stop
-                            Err(e) => Err(e),
-                        };
-
-                        if tx.send(status).await.is_err() {
-                            // Motion reciever has been dropped
-                            break;
                         }
                     }
                     Ok(())
@@ -291,5 +320,36 @@ impl Drop for MotionData {
             while handle.join_next().await.is_some() {}
             log::trace!("Dropped MotionData");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_latest_motion_status_wins() {
+        let now = Instant::now();
+        let start = Ok(MotionStatus::Start(now));
+        let stop = Ok(MotionStatus::Stop(now));
+        let other = Ok(MotionStatus::NoChange(now));
+
+        assert!(matches!(
+            supersede(Some(start), stop),
+            Ok(MotionStatus::Stop(_))
+        ));
+        assert!(matches!(
+            supersede(Some(Ok(MotionStatus::Stop(now))), other),
+            Ok(MotionStatus::Stop(_))
+        ));
+        assert!(matches!(
+            supersede(None, Ok(MotionStatus::NoChange(now))),
+            Ok(MotionStatus::NoChange(_))
+        ));
+        assert!(supersede(
+            Some(Ok(MotionStatus::Start(now))),
+            Err(Error::DroppedConnection)
+        )
+        .is_err());
     }
 }

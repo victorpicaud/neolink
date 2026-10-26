@@ -89,6 +89,9 @@ async fn main() -> Result<()> {
     config
         .validate()
         .with_context(|| format!("Failed to validate the {:?} config file", conf_path))?;
+    for ignored in config.ignored_options() {
+        warn!("{ignored}");
+    }
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
 

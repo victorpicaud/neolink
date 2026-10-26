@@ -19,6 +19,7 @@ static RE_MAXENC_SRC: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
+#[validate(schema(function = "validate_config"))]
 pub(crate) struct Config {
     #[validate(nested)]
     pub(crate) cameras: Vec<CameraConfig>,
@@ -26,7 +27,6 @@ pub(crate) struct Config {
     #[serde(rename = "bind", default = "default_bind_addr")]
     pub(crate) bind_addr: String,
 
-    #[validate(range(min = 0, max = 65535, message = "Invalid port", code = "bind_port"))]
     #[serde(default = "default_bind_port")]
     pub(crate) bind_port: u16,
 
@@ -36,6 +36,8 @@ pub(crate) struct Config {
     #[serde(default = "default_certificate")]
     pub(crate) certificate: Option<String>,
 
+    // Nested: the broker's rules were never checked
+    #[validate(nested)]
     #[serde(default = "Default::default")]
     pub(crate) mqtt: Option<MqttServerConfig>,
 
@@ -295,10 +297,10 @@ pub(crate) struct MqttDiscoveryConfig {
 }
 
 fn validate_mqtt_server(config: &MqttServerConfig) -> Result<(), ValidationError> {
-    if config.ca.is_some() && config.client_auth.is_some() {
-        Err(ValidationError::new(
-            "Cannot have both ca and client_auth set",
-        ))
+    // The other way round, the rule made client certificates impossible: they
+    // are only used over TLS, which needs the ca
+    if config.client_auth.is_some() && config.ca.is_none() {
+        Err(ValidationError::new("client_auth needs ca"))
     } else {
         Ok(())
     }
@@ -346,6 +348,13 @@ pub(crate) struct PauseConfig {
     #[serde(default = "default_on_disconnect", alias = "on_client")]
     pub(crate) on_disconnect: bool,
 
+    /// How long a stream paused on motion keeps going after the motion
+    /// stops, in seconds
+    #[validate(range(
+        min = 0.0,
+        max = 3600.0,
+        message = "Invalid motion timeout (it's in seconds)"
+    ))]
     #[serde(default = "default_motion_timeout", alias = "timeout")]
     pub(crate) motion_timeout: f64,
 
@@ -486,7 +495,8 @@ fn default_motion_timeout() -> f64 {
 }
 
 fn default_on_disconnect() -> bool {
-    false
+    // What a stream does: it stops shortly after its last client leaves
+    true
 }
 
 fn default_on_motion() -> bool {
@@ -542,10 +552,115 @@ fn validate_username(name: &str) -> Result<(), ValidationError> {
 }
 
 fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), ValidationError> {
+    // A camera's name is part of its RTSP paths and MQTT topics
+    let name = &camera_config.name;
+    if name.trim().is_empty() {
+        return Err(ValidationError::new("A camera needs a name"));
+    }
+    if name.contains(['/', '#', '+']) {
+        return Err(ValidationError::new(
+            "A camera's name cannot contain /, # or +, which RTSP paths or MQTT topics give a meaning",
+        ));
+    }
     match (&camera_config.camera_addr, &camera_config.camera_uid) {
         (None, None) => Err(ValidationError::new(
             "Either camera address or uid must be given",
         )),
         _ => Ok(()),
+    }
+}
+
+fn validate_config(config: &Config) -> Result<(), ValidationError> {
+    // Two cameras of a name would share their RTSP paths and MQTT topics
+    let mut names = HashSet::new();
+    for camera in config.cameras.iter() {
+        if !names.insert(camera.name.as_str()) {
+            return Err(ValidationError::new("Two cameras have the same name"));
+        }
+    }
+    Ok(())
+}
+
+impl Config {
+    /// The options set to something neolink ignores, with what happens
+    /// instead
+    pub(crate) fn ignored_options(&self) -> Vec<String> {
+        let mut ignored = vec![];
+        if self.tokio_console {
+            ignored.push("tokio_console is not supported, and is ignored".to_string());
+        }
+        for camera in self.cameras.iter() {
+            let name = &camera.name;
+            if camera.buffer_duration != default_buffer_duration() {
+                ignored.push(format!(
+                    "{name}: buffer_duration is ignored: clients get frames as soon as they arrive"
+                ));
+            }
+            if camera.pause.mode != default_pause_mode() {
+                ignored.push(format!(
+                    "{name}: pause.mode is ignored: a paused stream shows its last picture"
+                ));
+            }
+            if !camera.pause.on_disconnect {
+                ignored.push(format!(
+                    "{name}: pause.on_disconnect = false is ignored: a stream stops 10s after its last client leaves"
+                ));
+            }
+        }
+        ignored
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(toml: &str) -> Config {
+        toml::from_str(toml).unwrap()
+    }
+
+    const CAMERA: &str = "username = \"admin\"\naddress = \"127.0.0.1:9000\"\n";
+
+    #[test]
+    fn two_cameras_cannot_share_a_name() {
+        let ok = config(&format!(
+            "[[cameras]]\nname = \"a\"\n{CAMERA}[[cameras]]\nname = \"b\"\n{CAMERA}"
+        ));
+        assert!(ok.validate().is_ok());
+        let twice = config(&format!(
+            "[[cameras]]\nname = \"a\"\n{CAMERA}[[cameras]]\nname = \"a\"\n{CAMERA}"
+        ));
+        assert!(twice.validate().is_err());
+    }
+
+    #[test]
+    fn a_camera_name_cannot_break_paths_or_topics() {
+        for name in ["front/door", "front#", "front+", " "] {
+            let bad = config(&format!("[[cameras]]\nname = \"{name}\"\n{CAMERA}"));
+            assert!(bad.validate().is_err(), "{name:?}");
+        }
+        let spaced = config(&format!("[[cameras]]\nname = \"front door\"\n{CAMERA}"));
+        assert!(spaced.validate().is_ok());
+    }
+
+    #[test]
+    fn mqtt_client_certificates_need_a_ca() {
+        let mqtt = "cameras = []\n[mqtt]\nbroker_addr = \"broker\"\nport = 8883\n";
+        let auth = "client_auth = [\"cert.pem\", \"key.pem\"]\n";
+        let without_ca = config(&format!("{mqtt}{auth}"));
+        assert!(without_ca.validate().is_err());
+        let with_ca = config(&format!("{mqtt}ca = \"ca.pem\"\n{auth}"));
+        assert!(with_ca.validate().is_ok());
+    }
+
+    #[test]
+    fn options_that_do_nothing_are_reported() {
+        let quiet = config(&format!("[[cameras]]\nname = \"a\"\n{CAMERA}"));
+        assert!(quiet.ignored_options().is_empty());
+        let noisy = config(&format!(
+            "tokio_console = true\n[[cameras]]\nname = \"a\"\n{CAMERA}buffer_duration = 100\n\
+             [cameras.pause]\nmode = \"black\"\non_client = false\n"
+        ));
+        assert_eq!(noisy.ignored_options().len(), 4);
     }
 }

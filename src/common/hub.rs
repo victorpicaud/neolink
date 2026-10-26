@@ -520,13 +520,25 @@ async fn run_gate(
     };
     let mut alerts = MotionAlerts::new(&instance);
     let mut alerted_until = None;
+    // Once motion ends, the stream keeps going until then
+    let mut moved_until = None;
+    let mut was_moving = false;
     let mut announced = None;
     loop {
-        let on_motion = config.borrow_and_update().pause.on_motion;
+        let (on_motion, motion_timeout) = {
+            let config = config.borrow_and_update();
+            (config.pause.on_motion, config.pause.motion_timeout)
+        };
         let moving = motion
             .as_mut()
             .is_some_and(|motion| matches!(*motion.borrow_and_update(), MdState::Start(_)));
-        let open = !on_motion || moving || alerted_until.is_some();
+        if was_moving && !moving {
+            // Even a config that skipped validation must not panic here
+            let timeout = Duration::try_from_secs_f64(motion_timeout.clamp(0.0, 3600.0));
+            moved_until = Some(Instant::now() + timeout.unwrap_or_default());
+        }
+        was_moving = moving;
+        let open = !on_motion || moving || moved_until.is_some() || alerted_until.is_some();
         gate.send_if_modified(|gate| std::mem::replace(gate, open) != open);
         if on_motion && announced != Some(open) {
             if open {
@@ -546,6 +558,7 @@ async fn run_gate(
             },
             _ = alerts.next() => alerted_until = Some(Instant::now() + ALERT_WINDOW),
             _ = until(alerted_until) => alerted_until = None,
+            _ = until(moved_until) => moved_until = None,
         }
     }
 }
@@ -1010,7 +1023,7 @@ mod tests {
 name = \"cam\"
 username = \"admin\"
 address = \"127.0.0.1:1\"
-pause = {{ on_motion = {on_motion} }}
+pause = {{ on_motion = {on_motion}, motion_timeout = 2.0 }}
 "
         ))
         .unwrap();
@@ -1046,6 +1059,8 @@ pause = {{ on_motion = {on_motion} }}
         assert!(*gate.borrow());
         motion_tx.send_replace(MdState::Stop(Instant::now()));
         settle().await;
+        assert!(*gate.borrow(), "streaming on for pause.motion_timeout");
+        sleep(Duration::from_secs_f64(2.5)).await;
         assert!(!*gate.borrow());
 
         config_tx.send_replace(camera_config(false));

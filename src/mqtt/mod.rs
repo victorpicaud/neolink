@@ -85,6 +85,7 @@ use anyhow::{anyhow, Context, Result};
 pub(crate) use cmdline::Opt;
 pub(crate) use discovery::Discoveries;
 use log::*;
+pub(crate) use mqttc::set_client_id;
 use mqttc::{Mqtt, MqttReplyRef};
 
 use self::{

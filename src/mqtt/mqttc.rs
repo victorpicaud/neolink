@@ -1,35 +1,133 @@
 use crate::{
+    common::Backoff,
     config::{Config, MqttServerConfig},
     AnyResult,
 };
 use anyhow::{anyhow, Context, Result};
-use futures::future::FutureExt;
 use log::*;
 use rumqttc::{
-    AsyncClient, ConnectReturnCode, Event, EventLoop, Incoming, LastWill, MqttOptions, QoS,
-    TlsConfiguration, Transport,
+    AsyncClient, ConnectReturnCode, Event, EventLoop, Incoming, LastWill, MqttOptions, Outgoing,
+    QoS, TlsConfiguration, Transport,
 };
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 use tokio::task::JoinSet;
 use tokio::{
     sync::{
         broadcast::{channel as broadcast, Sender as BroadcastSender},
         mpsc::{channel as mpsc, Receiver as MpscReceiver, Sender as MpscSender},
         oneshot::{channel as oneshot, Sender as OneshotSender},
-        watch::Receiver as WatchReceiver,
+        watch::{self, Receiver as WatchReceiver},
     },
-    time::{sleep, Duration, Instant},
+    time::{sleep, timeout, Duration, Instant},
 };
 use tokio_stream::{
     wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
     StreamExt,
 };
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
+
+/// Where neolink says whether it is connected
+const STATUS_TOPIC: &str = "neolink/status";
+const CONNECTED: &str = "connected";
+/// What the broker says for neolink when it is gone, and what neolink says
+/// when it leaves
+const OFFLINE: &str = "offline";
+/// What neolink listens to
+const SUBSCRIPTIONS: [&str; 1] = ["neolink/#"];
+/// How many requests the client queues while the broker is away. Senders wait
+/// beyond that, rather than pile up previews.
+const REQUEST_CAPACITY: usize = 100;
+
+/// The client id this neolink uses, unless the config gives one
+static CLIENT_ID: OnceLock<String> = OnceLock::new();
+
+/// Sets the client id from what tells this neolink apart from another on the
+/// same host: its config file and its RTSP port. The same on every
+/// connection: a new one each time left the broker to publish the last will
+/// of the old connection, "offline", after the new one said "connected".
+pub(crate) fn set_client_id(config_path: &Path, config: &Config) {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|host| {
+            host.trim()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .take(32)
+                .collect::<String>()
+        })
+        .filter(|host| !host.is_empty());
+    let mut hasher = DefaultHasher::new();
+    config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf())
+        .hash(&mut hasher);
+    config.bind_port.hash(&mut hasher);
+    let hash = hasher.finish() as u32;
+    let id = match host {
+        Some(host) => format!("neolink-{host}-{hash:08x}"),
+        None => format!("neolink-{hash:08x}"),
+    };
+    let _ = CLIENT_ID.set(id);
+}
+
+fn client_id(config: &MqttServerConfig) -> String {
+    config.client_id.clone().unwrap_or_else(|| {
+        CLIENT_ID
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "neolink".to_string())
+    })
+}
+
+/// The options to connect with. A CA or client certificate that cannot be
+/// read is an error: the connection used to go ahead without encryption, and
+/// send the credentials in the clear.
+fn mqtt_options(config: &MqttServerConfig, client_id: String) -> AnyResult<MqttOptions> {
+    let mut options = MqttOptions::new(client_id, &config.broker_addr, config.port);
+    let max_size = 100 * (1024 * 1024);
+    options.set_max_packet_size(max_size, max_size);
+    if let Some(ca_path) = &config.ca {
+        let ca = std::fs::read(ca_path)
+            .with_context(|| format!("Could not read the MQTT ca {}", ca_path.display()))?;
+        let client_auth = match &config.client_auth {
+            Some((cert_path, key_path)) => Some((
+                std::fs::read(cert_path).with_context(|| {
+                    format!(
+                        "Could not read the MQTT client certificate {}",
+                        cert_path.display()
+                    )
+                })?,
+                std::fs::read(key_path).with_context(|| {
+                    format!("Could not read the MQTT client key {}", key_path.display())
+                })?,
+            )),
+            None => None,
+        };
+        options.set_transport(Transport::Tls(TlsConfiguration::Simple {
+            ca,
+            alpn: None,
+            client_auth,
+        }));
+    }
+    if let Some((username, password)) = &config.credentials {
+        options.set_credentials(username, password);
+    }
+    options.set_keep_alive(Duration::from_secs(5));
+    Ok(options)
+}
 
 pub(crate) struct Mqtt {
     cancel: CancellationToken,
+    incoming_tx: BroadcastSender<MqttReply>,
     outgoing_tx: MpscSender<MqttRequest>,
+    config: WatchReceiver<Config>,
     set: JoinSet<Result<()>>,
 }
 
@@ -40,59 +138,59 @@ impl Mqtt {
         let cancel = CancellationToken::new();
         let mut set = JoinSet::<AnyResult<()>>::new();
 
-        // Thread that handles the mqttc side
-        // including restarting it if the config changes
+        // Connects to the broker, and again if the config changes
         let thread_cancel = cancel.clone();
-        let mut thread_config = config;
-        let thread_incoming_tx = incoming_tx;
-        let thread_outgoing_tx = outgoing_tx.clone();
+        let mut thread_config = config.clone();
+        let thread_incoming_tx = incoming_tx.clone();
         set.spawn(async move {
-            let mut mqtt_config = thread_config.borrow().mqtt.clone();
-            let r = loop {
-                break tokio::select! {
-                    _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-                    v = thread_config.wait_for(|config| config.mqtt != mqtt_config).map(|res| res.map(|r| r.clone())) =>
-                    {
+            let mut mqtt_config = thread_config.borrow_and_update().mqtt.clone();
+            loop {
+                let result = tokio::select! {
+                    _ = thread_cancel.cancelled() => return AnyResult::Ok(()),
+                    v = thread_config.wait_for(|config| config.mqtt != mqtt_config) => {
                         mqtt_config = v?.mqtt.clone();
                         continue;
                     }
                     v = async {
-                        let mut backend = MqttBackend {
-                            incomming_tx: thread_incoming_tx.clone(),
-                            outgoing_rx: &mut outgoing_rx,
-                            outgoing_tx: thread_outgoing_tx.clone(),
-                            config: mqtt_config.as_ref().unwrap(),
-                            cancel: CancellationToken::new(),
-                        };
-                        backend.run().await
-                    }, if mqtt_config.is_some() => {
-                        if let Err(e) = &v {
-                            log::error!("MQTT Client Connection Failed: {:?}", e);
-                            sleep(Duration::from_secs(2)).await;
-                            continue;
+                        match mqtt_config.as_ref() {
+                            Some(server) => run_backend(server, &thread_incoming_tx, &mut outgoing_rx).await,
+                            None => std::future::pending().await,
                         }
-                        v
-                    },
+                    } => v,
                 };
-            };
-            log::debug!("MQTT thread stopped: {:?}", r);
-            r
+                match result {
+                    // Hung up
+                    Ok(()) => return Ok(()),
+                    // It cannot work as configured: until the config changes
+                    Err(e) => {
+                        error!("MQTT: {e:#}");
+                        tokio::select! {
+                            _ = thread_cancel.cancelled() => return Ok(()),
+                            v = thread_config.wait_for(|config| config.mqtt != mqtt_config) => {
+                                mqtt_config = v?.mqtt.clone();
+                            }
+                        }
+                    }
+                }
+            }
         });
 
         Self {
             cancel,
+            incoming_tx,
             outgoing_tx,
+            config,
             set,
-            // Send the drop message on clean disconnect
         }
     }
 
     pub async fn subscribe<T: Into<String>>(&self, name: T) -> AnyResult<MqttInstance> {
-        let (tx, rx) = oneshot();
-        self.outgoing_tx
-            .send(MqttRequest::Subscribe(name.into(), tx))
-            .await?;
-        rx.await?
+        Ok(MqttInstance::new(
+            name.into(),
+            &self.incoming_tx,
+            &self.outgoing_tx,
+            &self.config,
+        ))
     }
 }
 
@@ -105,8 +203,12 @@ impl Drop for Mqtt {
 
         crate::utils::spawn_cleanup(async move {
             let (tx, rx) = oneshot();
-            let _ = outgoing_tx.send(MqttRequest::HangUp(tx)).await;
-            let _ = rx.await;
+            // Not for long: no one answers while the config cannot work
+            let _ = timeout(Duration::from_secs(3), async {
+                let _ = outgoing_tx.send(MqttRequest::HangUp(tx)).await;
+                let _ = rx.await;
+            })
+            .await;
 
             log::debug!("Mqtt::drop Cancel");
             cancel.cancel();
@@ -116,217 +218,141 @@ impl Drop for Mqtt {
     }
 }
 
-struct MqttBackend<'a> {
-    incomming_tx: BroadcastSender<MqttReply>,
-    outgoing_rx: &'a mut MpscReceiver<MqttRequest>,
-    outgoing_tx: MpscSender<MqttRequest>,
-    config: &'a MqttServerConfig,
-    cancel: CancellationToken,
+/// Talks to the broker until told to hang up, reconnecting as long as it
+/// takes. Fails only if the config cannot work.
+async fn run_backend(
+    server: &MqttServerConfig,
+    incoming_tx: &BroadcastSender<MqttReply>,
+    outgoing_rx: &mut MpscReceiver<MqttRequest>,
+) -> AnyResult<()> {
+    let mut options = mqtt_options(server, client_id(server))?;
+    // On unclean disconnect send this
+    options.set_last_will(LastWill::new(STATUS_TOPIC, OFFLINE, QoS::AtLeastOnce, true));
+    let (client, eventloop) = AsyncClient::new(options, REQUEST_CAPACITY);
+    let (connected_tx, connected_rx) = watch::channel(0u64);
+    let closing = CancellationToken::new();
+
+    let broker = format!("{}:{}", server.broker_addr, server.port);
+    let mut event_loop = std::pin::pin!(poll_broker(
+        eventloop,
+        broker,
+        incoming_tx.clone(),
+        connected_tx,
+        closing.clone()
+    ));
+    let hung_up = tokio::select! {
+        v = &mut event_loop => return v,
+        v = publish(&client, outgoing_rx, connected_rx) => v?,
+    };
+    // Let the event loop send the goodbye
+    closing.cancel();
+    let _ = timeout(Duration::from_secs(2), &mut event_loop).await;
+    let _ = hung_up.send(());
+    Ok(())
 }
 
-impl<'a> MqttBackend<'a> {
-    async fn run(&mut self) -> AnyResult<()> {
-        log::trace!("Run MQTT Server");
-        let mut mqttoptions = MqttOptions::new(
-            format!("Neolink{}", Uuid::new_v4()),
-            &self.config.broker_addr,
-            self.config.port,
-        );
-        let max_size = 100 * (1024 * 1024);
-        mqttoptions.set_max_packet_size(max_size, max_size);
-
-        if let Some(transport) = tls_transport(self.config)? {
-            mqttoptions.set_transport(transport);
-        }
-
-        if let Some((username, password)) = &self.config.credentials {
-            mqttoptions.set_credentials(username, password);
-        }
-
-        mqttoptions.set_keep_alive(Duration::from_secs(5));
-
-        // On unclean disconnect send this
-        mqttoptions.set_last_will(LastWill::new(
-            "neolink/status".to_string(),
-            "offline",
-            QoS::AtLeastOnce,
-            true,
-        ));
-
-        let (client, mut connection) = AsyncClient::new(mqttoptions, 100);
-
-        let client = Arc::new(client);
-        let send_client = client.clone();
-        send_client
-            .publish(
-                "neolink/status".to_string(),
-                QoS::AtLeastOnce,
-                true,
-                "connected".to_string(),
-            )
-            .await?;
-        log::debug!("MQTT Published Startup");
-        let loop_cancel = CancellationToken::new();
-        let _drop_guard = loop_cancel.clone().drop_guard();
-        loop {
-            let r = tokio::select! {
-                v = self.outgoing_rx.recv() => {
-                    let msg = v.ok_or(anyhow!("All outgoing MQTT channels closed"))?;
-
-                    // Put it on a thread so that we don't block polling
-                    let outgoing_tx = self.outgoing_tx.clone();
-                    let incomming_tx = self.incomming_tx.clone();
-                    let send_client = send_client.clone();
-                    let cancel = self.cancel.clone();
-                    let thread_cancel = loop_cancel.clone();
-                    let server_config = self.config.clone();
-                    tokio::task::spawn(async move {
-                        tokio::select!{
-                            _ = cancel.cancelled() => AnyResult::Ok(()),
-                            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-                            v = async {
-                                match msg {
-                                    MqttRequest::Send(msg, tx) =>  {
-                                        let v = send_client.publish(
-                                            msg.topic.clone(),
-                                            QoS::AtLeastOnce,
-                                            false,
-                                            (*msg.message).clone(),
-                                        ).await;
-                                        match &v {
-                                            Ok(()) => {
-                                                let _ = tx.send(Ok(()));
-                                            },
-                                            Err(rumqttc::ClientError::Request(_)) | Err(rumqttc::ClientError::TryRequest(_)) => {
-                                                // Requeue it
-                                                outgoing_tx.send(MqttRequest::Send(msg, tx)).await?;
-                                            }
-                                        };
-                                        v?;
-                                    }
-                                    MqttRequest::SendRetained(msg, tx) =>  {
-                                        let v = send_client.publish(
-                                            msg.topic.clone(),
-                                            QoS::AtLeastOnce,
-                                            true,
-                                            (*msg.message).clone(),
-                                        ).await;
-                                        match &v {
-                                            Ok(()) => {
-                                                let _ = tx.send(Ok(()));
-                                            },
-                                            Err(rumqttc::ClientError::Request(_)) | Err(rumqttc::ClientError::TryRequest(_)) => {
-                                                // Requeue it
-                                                outgoing_tx.send(MqttRequest::Send(msg, tx)).await?;
-                                            }
-                                        };
-                                        v?;
-                                    }
-                                    MqttRequest::HangUp(reply) => {
-                                        send_client.publish(
-                                            "neolink/status".to_string(),
-                                            QoS::AtLeastOnce,
-                                            true,
-                                            "disconnected".to_string(),
-                                        ).await?;
-                                        let _ = reply.send(());
-                                        return Err(anyhow!("Disconneting"));
-                                    }
-                                    MqttRequest::Subscribe(name, reply) => {
-                                        let instance = MqttInstance {
-                                            name,
-                                            incomming_rx: BroadcastStream::new(incomming_tx.subscribe()),
-                                            outgoing_tx: outgoing_tx.clone(),
-                                            lag_warned_at: None,
-                                        };
-                                        let _ = reply.send(Ok(instance));
-                                    },
-                                    MqttRequest::LastWill{topic, message, reply} => {
-                                        let last_will = LastWillMqtt::new(
-                                            &server_config,
-                                            topic,
-                                            message,
-                                        ).await;
-                                        let _ = reply.send(last_will);
-                                    }
-                                }
-                                AnyResult::Ok(())
-                            } => v,
-                        }
-                    });
-
-                    AnyResult::Ok(())
-                },
-                v = connection.poll() =>  {
-                    let  notification = v.with_context(|| "MQTT connection dropped")?;
-                    // Handle message on another thread so that we can keep polling
-                    let client = client.clone();
-                    let incomming_tx = self.incomming_tx.clone();
-                    let cancel = self.cancel.clone();
-                    let thread_cancel = loop_cancel.clone();
-                    tokio::task::spawn(async move {
-                        tokio::select!{
-                            _ = cancel.cancelled() => AnyResult::Ok(()),
-                            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-                            v = async {
-                                match notification {
-                                    Event::Incoming(Incoming::ConnAck(connected)) => {
-                                        if ConnectReturnCode::Success == connected.code {
-                                            // Publish connected now that we are online
-                                            client
-                                            .publish(
-                                                "neolink/status".to_string(),
-                                                QoS::AtLeastOnce,
-                                                true,
-                                                "connected",
-                                            )
-                                            .await?;
-                                            // We succesfully logged in. Now ask for the cameras subscription.
-                                            client
-                                            .subscribe("neolink/#".to_string(), QoS::AtMostOnce)
-                                            .await?;
-                                        }
-                                    }
-                                    Event::Incoming(Incoming::Publish(published_message)) => {
-                                        if let Some(sub_topic) = published_message
-                                            .topic
-                                            .strip_prefix("neolink/")
-                                        {
-                                            let _ = incomming_tx
-                                                .send(MqttReply {
-                                                    topic: sub_topic.to_string(),
-                                                    message: Arc::new(String::from_utf8_lossy(published_message.payload.as_ref())
-                                                        .into_owned()),
-                                                });
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                AnyResult::Ok(())
-                            } => v
-                        }
-                    });
-                    AnyResult::Ok(())
-                },
-            };
-            if r.is_ok() {
-                continue;
+/// Polls the connection to the broker, which also reconnects it. Never waits
+/// on the client, which waits on this to take its requests.
+async fn poll_broker(
+    mut eventloop: EventLoop,
+    broker: String,
+    incoming_tx: BroadcastSender<MqttReply>,
+    connected: watch::Sender<u64>,
+    closing: CancellationToken,
+) -> AnyResult<()> {
+    let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+    loop {
+        match eventloop.poll().await {
+            Ok(Event::Incoming(Incoming::ConnAck(ack))) => {
+                if ack.code == ConnectReturnCode::Success {
+                    info!("MQTT: Connected to {broker}");
+                    backoff.reset();
+                    connected.send_modify(|connects| *connects += 1);
+                } else {
+                    warn!("MQTT: {broker} refused the connection: {:?}", ack.code);
+                }
             }
-            break r;
-        }?;
-        Ok(())
+            Ok(Event::Incoming(Incoming::Publish(published))) => {
+                if let Some(topic) = published.topic.strip_prefix("neolink/") {
+                    let _ = incoming_tx.send(MqttReply {
+                        topic: topic.to_string(),
+                        message: Arc::new(String::from_utf8_lossy(&published.payload).into_owned()),
+                        retain: published.retain,
+                    });
+                }
+            }
+            Ok(Event::Outgoing(Outgoing::Disconnect)) if closing.is_cancelled() => return Ok(()),
+            Ok(_) => {}
+            Err(_) if closing.is_cancelled() => return Ok(()),
+            Err(e) => {
+                let delay = backoff.next_delay();
+                warn!("MQTT: Lost the connection to {broker}, trying again in {delay:.1?}: {e}");
+                sleep(delay).await;
+            }
+        }
     }
 }
 
-impl Drop for MqttBackend<'_> {
-    fn drop(&mut self) {
-        self.cancel.cancel();
+/// Sends the requests in the order they come: the publishes used to go out
+/// each on a task of its own, in any order. On every connection, subscribes
+/// again and republishes the state, as the broker forgets the subscriptions,
+/// and may have lost the retained messages. Returns where to answer a hang up.
+async fn publish(
+    client: &AsyncClient,
+    requests: &mut MpscReceiver<MqttRequest>,
+    mut connected: watch::Receiver<u64>,
+) -> AnyResult<OneshotSender<()>> {
+    // The latest retained message on every topic
+    let mut retained: BTreeMap<String, Arc<String>> = BTreeMap::new();
+    loop {
+        tokio::select! {
+            biased;
+            v = connected.changed() => {
+                v?;
+                for topic in SUBSCRIPTIONS {
+                    client.subscribe(topic, QoS::AtMostOnce).await?;
+                }
+                client.publish(STATUS_TOPIC, QoS::AtLeastOnce, true, CONNECTED).await?;
+                for (topic, message) in retained.iter() {
+                    client
+                        .publish(topic, QoS::AtLeastOnce, true, message.as_bytes().to_vec())
+                        .await?;
+                }
+            }
+            request = requests.recv() => match request.ok_or(anyhow!("All outgoing MQTT channels closed"))? {
+                MqttRequest::Publish(msg, reply) => {
+                    if msg.retain {
+                        retained.insert(msg.topic.clone(), msg.message.clone());
+                    }
+                    // Retained or not as asked: a retained message used to be
+                    // sent again unretained when it had to wait
+                    let sent = client
+                        .publish(&msg.topic, QoS::AtLeastOnce, msg.retain, msg.message.as_bytes().to_vec())
+                        .await;
+                    let _ = reply.send(sent.map_err(Into::into));
+                }
+                MqttRequest::Republish(topic) => {
+                    if let Some(message) = retained.get(&topic) {
+                        client
+                            .publish(&topic, QoS::AtLeastOnce, true, message.as_bytes().to_vec())
+                            .await?;
+                    }
+                }
+                MqttRequest::HangUp(reply) => {
+                    client.publish(STATUS_TOPIC, QoS::AtLeastOnce, true, OFFLINE).await?;
+                    client.disconnect().await?;
+                    return Ok(reply);
+                }
+            }
+        }
     }
 }
 
 pub(crate) struct MqttInstance {
     outgoing_tx: MpscSender<MqttRequest>,
+    incoming_tx: BroadcastSender<MqttReply>,
     incomming_rx: BroadcastStream<MqttReply>,
+    config: WatchReceiver<Config>,
     name: String,
     /// When this reader last warned that it fell behind
     lag_warned_at: Option<Instant>,
@@ -336,24 +362,37 @@ pub(crate) struct MqttInstance {
 const LAG_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 impl MqttInstance {
+    fn new(
+        name: String,
+        incoming_tx: &BroadcastSender<MqttReply>,
+        outgoing_tx: &MpscSender<MqttRequest>,
+        config: &WatchReceiver<Config>,
+    ) -> Self {
+        Self {
+            outgoing_tx: outgoing_tx.clone(),
+            incoming_tx: incoming_tx.clone(),
+            incomming_rx: BroadcastStream::new(incoming_tx.subscribe()),
+            config: config.clone(),
+            name,
+            lag_warned_at: None,
+        }
+    }
+
     pub(crate) fn get_name(&self) -> &str {
         &self.name
     }
 
     pub async fn subscribe<T: Into<String>>(&self, name: T) -> AnyResult<Self> {
-        let (tx, rx) = oneshot();
-        self.outgoing_tx
-            .send(MqttRequest::Subscribe(name.into(), tx))
-            .await?;
-        rx.await?
+        Ok(Self::new(
+            name.into(),
+            &self.incoming_tx,
+            &self.outgoing_tx,
+            &self.config,
+        ))
     }
 
     pub async fn resubscribe(&self) -> AnyResult<Self> {
-        let (tx, rx) = oneshot();
-        self.outgoing_tx
-            .send(MqttRequest::Subscribe(self.name.clone(), tx))
-            .await?;
-        rx.await?
+        self.subscribe(self.name.clone()).await
     }
 
     pub async fn send_message_with_root_topic(
@@ -372,31 +411,14 @@ impl MqttInstance {
         .filter(|s| !s.is_empty())
         .cloned()
         .collect::<Vec<_>>();
-        if retain {
-            let (tx, rx) = oneshot();
-            self.outgoing_tx
-                .send(MqttRequest::SendRetained(
-                    MqttReply {
-                        topic: topics.join("/"),
-                        message: Arc::new(message.to_string()),
-                    },
-                    tx,
-                ))
-                .await?;
-            rx.await??;
-        } else {
-            let (tx, rx) = oneshot();
-            self.outgoing_tx
-                .send(MqttRequest::Send(
-                    MqttReply {
-                        topic: topics.join("/"),
-                        message: Arc::new(message.to_string()),
-                    },
-                    tx,
-                ))
-                .await?;
-            rx.await??;
-        }
+        let msg = MqttReply {
+            topic: topics.join("/"),
+            message: Arc::new(message.to_string()),
+            retain,
+        };
+        let (tx, rx) = oneshot();
+        self.outgoing_tx.send(MqttRequest::Publish(msg, tx)).await?;
+        rx.await??;
         Ok(())
     }
 
@@ -440,22 +462,17 @@ impl MqttInstance {
                 }
                 None => return Err(anyhow!("End of client data")),
             };
-            // log::debug!("Got MQTT: {msg:?}");
-            // log::debug!("self.name: {:?}", self.name);
 
             if self.name.is_empty() {
                 break msg;
             } else {
                 let mut topics = msg.topic.split('/');
                 let sub_topic = topics.next();
-                // log::debug!("topics: {:?}", msg.topic);
-                // log::debug!("sub_topic: {sub_topic:?}");
                 if sub_topic
                     .map(|subtopic| *subtopic == self.name)
                     .unwrap_or(false)
                 {
                     msg.topic = topics.collect::<Vec<_>>().join("/");
-                    // log::debug!("new topics: {:?}", msg.topic);
                     break msg;
                 }
             }
@@ -468,16 +485,12 @@ impl MqttInstance {
         } else {
             format!("neolink/{}/{}", self.name, topic)
         };
-
-        let (tx, rx) = oneshot();
-        self.outgoing_tx
-            .send(MqttRequest::LastWill {
-                topic,
-                message: message.to_string(),
-                reply: tx,
-            })
-            .await?;
-        rx.await?
+        Ok(LastWillMqtt::new(
+            self.config.clone(),
+            topic,
+            message.to_string(),
+            self.outgoing_tx.clone(),
+        ))
     }
 }
 
@@ -485,6 +498,9 @@ impl MqttInstance {
 pub(crate) struct MqttReply {
     pub(crate) topic: String,
     pub(crate) message: Arc<String>, // Messages can be long so avoid costly clones with an arc
+    /// Whether the broker kept it from before: it then comes on subscribing,
+    /// whenever it was sent
+    pub(crate) retain: bool,
 }
 
 impl MqttReply {
@@ -502,105 +518,123 @@ pub(crate) struct MqttReplyRef<'a> {
 }
 
 enum MqttRequest {
-    Send(MqttReply, OneshotSender<Result<()>>),
-    SendRetained(MqttReply, OneshotSender<Result<()>>),
+    Publish(MqttReply, OneshotSender<Result<()>>),
+    /// Publish a topic's retained message again, if there is one
+    Republish(String),
     HangUp(OneshotSender<()>),
-    Subscribe(String, OneshotSender<Result<MqttInstance>>),
-    LastWill {
-        topic: String,
-        message: String,
-        reply: OneshotSender<Result<LastWillMqtt>>,
-    },
 }
 
-/// The TLS to connect with, if the config asks for it. A CA or client
-/// certificate that cannot be read is an error: the connection used to go
-/// ahead without encryption, and send the credentials in the clear.
-fn tls_transport(config: &MqttServerConfig) -> AnyResult<Option<Transport>> {
-    let Some(ca_path) = &config.ca else {
-        return Ok(None);
-    };
-    let ca = std::fs::read(ca_path)
-        .with_context(|| format!("Could not read the MQTT ca {}", ca_path.display()))?;
-    let client_auth = match &config.client_auth {
-        Some((cert_path, key_path)) => Some((
-            std::fs::read(cert_path).with_context(|| {
-                format!(
-                    "Could not read the MQTT client certificate {}",
-                    cert_path.display()
-                )
-            })?,
-            std::fs::read(key_path).with_context(|| {
-                format!("Could not read the MQTT client key {}", key_path.display())
-            })?,
-        )),
-        None => None,
-    };
-    Ok(Some(Transport::Tls(TlsConfiguration::Simple {
-        ca,
-        alpn: None,
-        client_auth,
-    })))
-}
-
+/// A connection whose only job is its last will, which the broker publishes
+/// once the connection is gone, as when neolink stops without a word
 pub(crate) struct LastWillMqtt {
     cancel: CancellationToken,
 }
 
 impl LastWillMqtt {
-    pub(crate) async fn new(
-        config: &MqttServerConfig,
+    /// Reconnects as long as it takes, to whichever broker the config names.
+    /// It used to give up at the first error, and the broker then had no last
+    /// will to publish.
+    fn new(
+        config: WatchReceiver<Config>,
         topic: String,
         message: String,
-    ) -> AnyResult<Self> {
-        log::trace!("Run MQTT Last Will");
-        let mut mqttoptions = MqttOptions::new(
-            format!("NeolinkLastWill_{}_{}", topic, Uuid::new_v4()),
-            &config.broker_addr,
-            config.port,
-        );
-        let max_size = 100 * (1024 * 1024);
-        mqttoptions.set_max_packet_size(max_size, max_size);
-
-        if let Some(transport) = tls_transport(config)? {
-            mqttoptions.set_transport(transport);
-        }
-
-        if let Some((username, password)) = &config.credentials {
-            mqttoptions.set_credentials(username, password);
-        }
-
-        mqttoptions.set_keep_alive(Duration::from_secs(5));
-
-        // On unclean disconnect send this
-        mqttoptions.set_last_will(LastWill::new(topic, message, QoS::AtLeastOnce, true));
-
-        let (client, connection) = AsyncClient::new(mqttoptions, 100);
+        outgoing_tx: MpscSender<MqttRequest>,
+    ) -> Self {
         let cancel = CancellationToken::new();
-        let thread_cancel = cancel.clone();
-
-        tokio::task::spawn(async move {
-            let r = poll_last_will(connection, thread_cancel).await;
-            drop(client);
-            r
-        });
-
-        Ok(LastWillMqtt { cancel })
+        tokio::task::spawn(keep_last_will(
+            config,
+            topic,
+            message,
+            outgoing_tx,
+            cancel.clone(),
+        ));
+        LastWillMqtt { cancel }
     }
 }
 
-/// Keep the last-will connection alive until `cancel` fires or the
-/// connection fails.
+async fn keep_last_will(
+    mut config: WatchReceiver<Config>,
+    topic: String,
+    message: String,
+    outgoing_tx: MpscSender<MqttRequest>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let server = config.borrow_and_update().mqtt.clone();
+        let connection = async {
+            let Some(server) = server.as_ref() else {
+                return std::future::pending().await;
+            };
+            let mut hasher = DefaultHasher::new();
+            topic.hash(&mut hasher);
+            let id = format!("{}-will-{:08x}", client_id(server), hasher.finish() as u32);
+            let mut options = match mqtt_options(server, id) {
+                Ok(options) => options,
+                // The main connection says why
+                Err(_) => return std::future::pending().await,
+            };
+            options.set_last_will(LastWill::new(
+                &topic,
+                message.as_str(),
+                QoS::AtLeastOnce,
+                true,
+            ));
+            let (client, connection) = AsyncClient::new(options, 10);
+            let polled = poll_last_will(
+                connection,
+                topic.clone(),
+                outgoing_tx.clone(),
+                cancel.clone(),
+            )
+            .await;
+            drop(client);
+            polled
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            v = config.wait_for(|config| config.mqtt != server) => if v.is_err() {
+                return;
+            },
+            _ = connection => return,
+        }
+    }
+}
+
+/// Keeps the last-will connection up until `cancel` fires, reconnecting
+/// after an error.
 ///
 /// Cancellation must end the loop: `cancelled()` stays ready once the token
 /// is cancelled, so treating it as just another iteration spins forever
 /// without yielding and pins a runtime worker.
-async fn poll_last_will(mut connection: EventLoop, cancel: CancellationToken) -> AnyResult<()> {
+async fn poll_last_will(
+    mut connection: EventLoop,
+    topic: String,
+    outgoing_tx: MpscSender<MqttRequest>,
+    cancel: CancellationToken,
+) -> AnyResult<()> {
+    let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break Ok(()),
-            v = connection.poll() => {
-                v?;
+            v = connection.poll() => match v {
+                Ok(Event::Incoming(Incoming::ConnAck(_))) => {
+                    backoff.reset();
+                    // Connecting again took over the connection from before,
+                    // and the broker published that one's will then: what the
+                    // topic really says goes after it. Skipped rather than
+                    // waited for if the publisher is busy, so that this
+                    // connection keeps up with its broker.
+                    let _ = outgoing_tx.try_send(MqttRequest::Republish(topic.clone()));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let delay = backoff.next_delay();
+                    debug!("MQTT: A last will connection was lost, trying again in {delay:.1?}: {e}");
+                    tokio::select! {
+                        _ = cancel.cancelled() => break Ok(()),
+                        _ = sleep(delay) => {}
+                    }
+                }
             }
         }
     }
@@ -615,6 +649,7 @@ impl Drop for LastWillMqtt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rumqttc::Request;
 
     /// Cancelling a last-will connection used to leave its task spinning at
     /// 100% CPU, so the loop never finished.
@@ -634,7 +669,12 @@ mod tests {
         let (_client, connection) =
             AsyncClient::new(MqttOptions::new("neolink-test", "127.0.0.1", port), 10);
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(poll_last_will(connection, cancel.clone()));
+        let task = tokio::spawn(poll_last_will(
+            connection,
+            "neolink/cam/status".to_string(),
+            mpsc(1).0,
+            cancel.clone(),
+        ));
         sleep(Duration::from_millis(200)).await;
         cancel.cancel();
 
@@ -645,33 +685,20 @@ mod tests {
         assert!(result.unwrap().is_ok());
     }
 
-    #[test]
-    fn a_ca_that_cannot_be_read_is_an_error_not_a_connection_in_the_clear() {
-        let config: MqttServerConfig =
-            toml::from_str("broker_addr = \"broker\"\nport = 8883\nca = \"/nonexistent/ca.pem\"\n")
-                .unwrap();
-        let Err(error) = tls_transport(&config) else {
-            panic!("connected without the CA");
-        };
-        assert!(
-            format!("{error:#}").contains("Could not read the MQTT ca"),
-            "{error:#}"
-        );
+    fn config() -> WatchReceiver<Config> {
+        watch::channel(toml::from_str::<Config>("cameras = []").unwrap()).1
     }
 
     #[tokio::test]
     async fn a_reader_that_fell_behind_skips_what_it_missed() -> AnyResult<()> {
-        let (incoming_tx, incoming_rx) = broadcast(4);
-        let mut instance = MqttInstance {
-            outgoing_tx: mpsc(1).0,
-            incomming_rx: BroadcastStream::new(incoming_rx),
-            name: "cam".to_string(),
-            lag_warned_at: None,
-        };
+        let (incoming_tx, _) = broadcast(4);
+        let mut instance =
+            MqttInstance::new("cam".to_string(), &incoming_tx, &mpsc(1).0, &config());
         for i in 0..10 {
             incoming_tx.send(MqttReply {
                 topic: format!("cam/topic{i}"),
                 message: Arc::new(String::new()),
+                retain: false,
             })?;
         }
 
@@ -679,5 +706,133 @@ mod tests {
         assert_eq!(instance.recv().await?.topic, "topic6");
         assert_eq!(instance.recv().await?.topic, "topic7");
         Ok(())
+    }
+
+    /// What was asked of the broker: the topics subscribed to, and those
+    /// published to, with whether they were retained
+    fn asked(requests: &flume::Receiver<Request>) -> (Vec<String>, Vec<(String, bool)>) {
+        let mut subscribed = vec![];
+        let mut published = vec![];
+        for request in requests.drain() {
+            match request {
+                Request::Subscribe(subscribe) => {
+                    subscribed.extend(subscribe.filters.into_iter().map(|filter| filter.path))
+                }
+                Request::Publish(publish) => published.push((publish.topic, publish.retain)),
+                _ => {}
+            }
+        }
+        (subscribed, published)
+    }
+
+    async fn send(outgoing_tx: &MpscSender<MqttRequest>, topic: &str, retain: bool) {
+        let (tx, rx) = oneshot();
+        let msg = MqttReply {
+            topic: topic.to_string(),
+            message: Arc::new("message".to_string()),
+            retain,
+        };
+        outgoing_tx
+            .send(MqttRequest::Publish(msg, tx))
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_connection_gets_the_subscriptions_and_the_state_again() {
+        let (request_tx, requests) = flume::bounded(100);
+        let client = AsyncClient::from_senders(request_tx);
+        let (outgoing_tx, mut outgoing_rx) = mpsc(10);
+        let (connected_tx, connected_rx) = watch::channel(0u64);
+        let publisher = tokio::spawn(async move {
+            publish(&client, &mut outgoing_rx, connected_rx)
+                .await
+                .map(|_| ())
+        });
+
+        send(&outgoing_tx, "neolink/cam/status", true).await;
+        send(&outgoing_tx, "neolink/cam/control/led", false).await;
+        send(&outgoing_tx, "neolink/cam/status", true).await;
+        let (subscribed, published) = asked(&requests);
+        assert!(subscribed.is_empty());
+        let topic = |topic: &str, retain| (topic.to_string(), retain);
+        assert_eq!(
+            published,
+            [
+                topic("neolink/cam/status", true),
+                topic("neolink/cam/control/led", false),
+                topic("neolink/cam/status", true),
+            ],
+            "in the order they came"
+        );
+
+        // (Re)connected
+        connected_tx.send_modify(|connects| *connects += 1);
+        let (mut subscribed, mut published) = (vec![], vec![]);
+        for _ in 0..100 {
+            let (more_subscribed, more_published) = asked(&requests);
+            subscribed.extend(more_subscribed);
+            published.extend(more_published);
+            if published.len() >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(subscribed, SUBSCRIPTIONS);
+        assert_eq!(
+            published,
+            [
+                topic("neolink/status", true),
+                topic("neolink/cam/status", true)
+            ],
+            "neolink is connected, and the state is as it was"
+        );
+        publisher.abort();
+    }
+
+    #[tokio::test]
+    async fn a_topic_is_published_again_after_a_last_will_on_it() {
+        let (request_tx, requests) = flume::bounded(100);
+        let client = AsyncClient::from_senders(request_tx);
+        let (outgoing_tx, mut outgoing_rx) = mpsc(10);
+        let (_connected_tx, connected_rx) = watch::channel(0u64);
+        let publisher = tokio::spawn(async move {
+            publish(&client, &mut outgoing_rx, connected_rx)
+                .await
+                .map(|_| ())
+        });
+        send(&outgoing_tx, "neolink/cam/status", true).await;
+        asked(&requests);
+
+        for topic in ["neolink/cam/status", "neolink/cam/never/sent"] {
+            outgoing_tx
+                .send(MqttRequest::Republish(topic.to_string()))
+                .await
+                .unwrap();
+        }
+        send(&outgoing_tx, "neolink/cam/after", false).await;
+        let (_, published) = asked(&requests);
+        let topic = |topic: &str, retain| (topic.to_string(), retain);
+        assert_eq!(
+            published,
+            [
+                topic("neolink/cam/status", true),
+                topic("neolink/cam/after", false)
+            ]
+        );
+        publisher.abort();
+    }
+
+    #[test]
+    fn a_ca_that_cannot_be_read_is_an_error_not_a_connection_in_the_clear() {
+        let config: MqttServerConfig =
+            toml::from_str("broker_addr = \"broker\"\nport = 8883\nca = \"/nonexistent/ca.pem\"\n")
+                .unwrap();
+        let error = mqtt_options(&config, "neolink-test".to_string()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Could not read the MQTT ca"),
+            "{error:#}"
+        );
     }
 }

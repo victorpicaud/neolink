@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
     for ignored in config.ignored_options() {
         warn!("{ignored}");
     }
+    mqtt::set_client_id(&conf_path, &config);
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
 

@@ -70,6 +70,11 @@ pub(crate) struct MqttServerConfig {
 
     #[serde(default, skip_serializing)]
     pub(crate) client_auth: Option<(std::path::PathBuf, std::path::PathBuf)>,
+
+    /// What neolink calls itself to the broker. By default, one made from
+    /// the host, the config file and the RTSP port, the same every time.
+    #[serde(default)]
+    pub(crate) client_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq)]

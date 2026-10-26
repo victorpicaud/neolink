@@ -46,13 +46,13 @@ tokio = { version = "1.27.0", features = ["rt-multi-thread", "macros", "io-util"
 tokio-stream = "0.1.12"
 tokio-util = { version = "0.7.7", features = ["full"] }
 toml = "0.8.2"
-uuid = { version = "1.8.0", features = ["v4"] }
 validator = { version = "0.21", features = ["derive"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.7"
 
 [dev-dependencies]
+flume = "0.11"
 tokio = { version = "1.27.0", features = ["test-util"] }
 
 [features]

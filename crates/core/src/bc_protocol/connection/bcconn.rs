@@ -750,6 +750,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_id_subscription_made_first_gets_what_comes_before_the_reply() {
+        let (connection, camera, _written) = connection(10).await;
+        let mut reply = connection.subscribe(MSG_ID_SNAP, 1).await.unwrap();
+        let mut data = connection.subscribe_to_id(MSG_ID_SNAP, 10).await.unwrap();
+
+        // The camera starts the image, on a number of its own, before replying
+        camera.send(Ok(msg(MSG_ID_SNAP, 7))).await.unwrap();
+        camera.send(Ok(msg(MSG_ID_SNAP, 1))).await.unwrap();
+        camera.send(Ok(msg(MSG_ID_SNAP, 7))).await.unwrap();
+
+        assert_eq!(soon(reply.recv()).await.unwrap().meta.msg_num, 1);
+        assert_eq!(soon(data.recv()).await.unwrap().meta.msg_num, 7);
+        assert_eq!(soon(data.recv()).await.unwrap().meta.msg_num, 7);
+    }
+
+    #[tokio::test]
     async fn an_event_subscription_sees_every_message_number() {
         let (connection, camera, _written) = connection(10).await;
         let mut events = connection

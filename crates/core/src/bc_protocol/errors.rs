@@ -170,6 +170,15 @@ pub enum Error {
     #[error("Dropped Subscriber")]
     DroppedSubscriber,
 
+    /// Raised when the camera sends less of a snapshot than it announced
+    #[error("The camera sent {received} bytes of a {expected} byte snapshot")]
+    SnapshotTruncated {
+        /// The size the camera announced
+        expected: usize,
+        /// The bytes that arrived
+        received: usize,
+    },
+
     /// Raised when a subscriber fell so far behind that its queue filled up
     #[error("Subscription to message {msg_id} fell behind and was ended")]
     SubscriptionOverflow {

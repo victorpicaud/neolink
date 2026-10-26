@@ -12,6 +12,13 @@ impl BcCamera {
         let connection = self.get_connection();
         let msg_num = self.new_message_num();
         let mut sub_get = connection.subscribe(MSG_ID_SNAP, msg_num).await?;
+        // The image comes on a message number of the camera's choosing, and
+        // can start before the reply to the request. Listening for it only
+        // after that reply lost its start: a truncated image, or none at all.
+        // The reply still goes to `sub_get`, which has its number.
+        let sub_data = connection
+            .subscribe_to_id(MSG_ID_SNAP, SNAPSHOT_CAPACITY)
+            .await?;
         let get = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_SNAP,
@@ -64,17 +71,14 @@ impl BcCamera {
             ..
         }) = msg.body
         {
-            drop(sub_get); // Ensure that we are NOT listening on that msgnum as the reply can come on ANY msgnum
+            drop(sub_get);
             log::trace!("Got snap XML {} with size {}", filename, expected_size);
             // Messages are now sent on ID 109 but not with the same message ID
             // preumably because the camera considers it to be a new message rather
             // than a reply
             //
-            // This means we need to listen for the next 109 grab the message num and
-            // subscribe to it. This is what `subscribe_to_next` is for
-            let mut sub_get = connection
-                .subscribe_to_id(MSG_ID_SNAP, SNAPSHOT_CAPACITY)
-                .await?;
+            // `sub_data` takes the number of the first one
+            let mut sub_get = sub_data;
             let expected_size = expected_size as usize;
 
             let mut result: Vec<_> = vec![];
@@ -129,8 +133,12 @@ impl BcCamera {
                         result.len(),
                         expected_size
                     );
+                    // A short image used to be handed over as it was
                     if result.len() != expected_size {
-                        log::debug!("Snap did not recieve expected number of bytes");
+                        return Err(Error::SnapshotTruncated {
+                            expected: expected_size,
+                            received: result.len(),
+                        });
                     }
                 } else {
                     return Err(Error::UnintelligibleReply {

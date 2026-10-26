@@ -3,7 +3,7 @@ name = "neolink"
 description = "A standards-compliant bridge to Reolink IP cameras"
 version = "0.6.3-rc.3"
 authors = ["George Hilliard <thirtythreeforty@gmail.com>", "Andrew King <sheepchaan@gmail.com>"]
-edition = "2018"
+edition = "2021"
 license = "AGPL-3.0-or-later"
 
 [workspace]
@@ -36,9 +36,9 @@ regex = "1.7.3"
 rumqttc = "0.24.0"
 serde = { version = "1.0.160", features = ["derive"] }
 serde_json = "1.0.96"
-tokio = { version = "1.27.0", features = ["rt-multi-thread", "macros", "io-util", "tracing"] }
+tokio = { version = "1.27.0", features = ["rt-multi-thread", "macros", "io-util", "signal"] }
 tokio-stream = "0.1.12"
-tokio-util = { version = "0.7.7", features = ["full", "tracing"] }
+tokio-util = { version = "0.7.7", features = ["full"] }
 toml = "0.8.2"
 uuid = { version = "1.8.0", features = ["v4"] }
 validator = {version="0.18.1", features = ["derive"] }

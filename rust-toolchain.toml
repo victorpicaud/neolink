@@ -1,0 +1,5 @@
+[toolchain]
+# Keep in sync with `rust_version` in .github/workflows/build.yml
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

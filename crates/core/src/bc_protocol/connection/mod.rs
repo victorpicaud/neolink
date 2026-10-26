@@ -11,6 +11,7 @@ use tokio::net::UdpSocket;
 mod bcconn;
 mod bcsub;
 mod discovery;
+mod reliable;
 mod tcpsource;
 mod udpsource;
 

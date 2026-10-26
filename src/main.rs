@@ -41,6 +41,7 @@ mod battery;
 mod cmdline;
 mod common;
 mod config;
+mod healthcheck;
 #[cfg(feature = "gstreamer")]
 mod image;
 mod mqtt;
@@ -83,13 +84,18 @@ async fn run() -> Result<()> {
         default_hook(info);
     }));
 
+    let opt = Opt::parse();
+    // Without a config, as it only reads heartbeats, and quietly, as it runs
+    // every few seconds
+    if let Some(Command::Healthcheck(opts)) = &opt.cmd {
+        return healthcheck::main(opts);
+    }
+
     info!(
         "Neolink {} {}",
         env!("NEOLINK_VERSION"),
         env!("NEOLINK_PROFILE")
     );
-
-    let opt = Opt::parse();
 
     let conf_path = opt.config.context("Must supply --config file")?;
     let config: Config = toml::from_str(
@@ -108,6 +114,10 @@ async fn run() -> Result<()> {
 
     let stop = stop_on_signal();
     let neo_reactor = NeoReactor::new(config.clone()).await;
+    if serves(&opt.cmd) {
+        healthcheck::clear();
+        beat_while_alive(neo_reactor.clone());
+    }
 
     let result = match opt.cmd {
         #[cfg(feature = "gstreamer")]
@@ -178,12 +188,40 @@ async fn run() -> Result<()> {
         Some(Command::Users(opts)) => {
             unless_stopped(&stop, users::main(opts, neo_reactor.clone())).await
         }
+        Some(Command::Healthcheck(opts)) => healthcheck::main(&opts),
     };
 
     // Logged out of every camera, rather than leaving each to time its
     // session out
     neo_reactor.shutdown().await;
     result
+}
+
+/// Whether the command serves until it is stopped, rather than doing one
+/// thing
+fn serves(command: &Option<Command>) -> bool {
+    match command {
+        None | Some(Command::Mqtt(_)) => true,
+        #[cfg(feature = "gstreamer")]
+        Some(Command::Rtsp(_) | Command::MqttRtsp(_)) => true,
+        _ => false,
+    }
+}
+
+/// Beats for the healthcheck while the reactor answers: neither it nor the
+/// async runtime froze
+fn beat_while_alive(reactor: NeoReactor) {
+    tokio::spawn(async move {
+        let heartbeat = healthcheck::Heartbeat::new("neolink", "neolink");
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            ticks.tick().await;
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(5), reactor.config()).await
+            {
+                heartbeat.beat();
+            }
+        }
+    });
 }
 
 /// Runs a command that does its one thing and ends, unless neolink is asked

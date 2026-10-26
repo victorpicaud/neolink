@@ -4,7 +4,7 @@
 //! expect issues
 
 use super::AnyResult;
-use crate::config::*;
+use crate::{config::*, healthcheck::Heartbeat};
 
 use anyhow::{anyhow, Context};
 use gstreamer::glib::{self, object_subclass, MainLoop, Object};
@@ -114,6 +114,14 @@ impl NeoRtspServer {
             })
             .context("Could not start the RTSP main loop")?;
 
+        // Beats for the healthcheck while the main loop runs: when it froze,
+        // so did every client
+        let heartbeat = Heartbeat::new("rtsp", "the RTSP server");
+        let beating = glib::timeout_add_seconds(1, move || {
+            heartbeat.beat();
+            glib::ControlFlow::Continue
+        });
+
         let sessions_server = server.clone();
         tokio::task::spawn(async move {
             let mut ticks = interval(Duration::from_secs(5));
@@ -123,6 +131,7 @@ impl NeoRtspServer {
                     _ = ticks.tick() => sessions_server.clean_up_sessions(),
                 }
             }
+            beating.remove();
         });
         Ok(QuitOnDrop(server.clone()))
     }

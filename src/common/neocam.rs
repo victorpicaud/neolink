@@ -14,7 +14,7 @@ use tokio::{
         watch::{channel as watch, Receiver as WatchReceiver, Sender as WatchSender},
     },
     task::JoinSet,
-    time::{sleep, timeout, Duration},
+    time::{interval, sleep, timeout, Duration},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +27,7 @@ use super::{
 use super::{HubSubscription, StreamHub};
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
-use crate::{config::CameraConfig, AnyResult, Result};
+use crate::{config::CameraConfig, healthcheck::Heartbeat, AnyResult, Result};
 use neolink_core::bc_protocol::BcCamera;
 #[cfg(feature = "gstreamer")]
 use {neolink_core::bc_protocol::StreamKind, std::collections::HashMap};
@@ -217,6 +217,32 @@ impl NeoCam {
         )
         .await;
         me.set.spawn(async move { cam_thread.run().await });
+
+        // Beats for the healthcheck while the camera's actor answers, as one
+        // that froze stopped every command to its camera
+        let heartbeat = Heartbeat::new(
+            &format!("camera-{}", config.name),
+            &format!("camera {}", config.name),
+        );
+        let heartbeat_commander = commander_tx.clone();
+        let heartbeat_cancel = me.cancel.clone();
+        me.set.spawn(async move {
+            let mut ticks = interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = heartbeat_cancel.cancelled() => return AnyResult::Ok(()),
+                    _ = ticks.tick() => {}
+                }
+                let (reply, answer) = oneshot();
+                if heartbeat_commander
+                    .try_send(NeoCamCommand::Config(reply))
+                    .is_ok()
+                    && matches!(timeout(Duration::from_secs(5), answer).await, Ok(Ok(_)))
+                {
+                    heartbeat.beat();
+                }
+            }
+        });
 
         // This thread monitors the motion
         let md_instance = instance.subscribe().await?;

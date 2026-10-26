@@ -92,6 +92,10 @@ RUN gst-inspect-1.0; \
 
 ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554
 
+# Whether neolink still works: see `neolink healthcheck --help`
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD ["/usr/local/bin/neolink", "healthcheck"]
+
 # The entrypoint runs neolink in NEO_LINK_MODE unless given a command
 CMD []
 ENTRYPOINT ["/entrypoint.sh"]

@@ -29,6 +29,14 @@ spec:
         command: ["/bin/sh", "-c"]
         # exec: neolink must take the shell's place to get the signal to stop
         args: ["cp /config/neolink.toml /etc/neolink.toml && exec /usr/local/bin/neolink rtsp --config /etc/neolink.toml"]
+        # Restarts neolink if part of it freezes
+        livenessProbe:
+          exec:
+            command: ["/usr/local/bin/neolink", "healthcheck"]
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
         volumeMounts:
           - name: config-volume
             mountPath: /config

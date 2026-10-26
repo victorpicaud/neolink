@@ -109,6 +109,8 @@ jobs:
         run: bash iso-test/sim/mqtt-broker.sh
       - name: End-to-end shutdown test
         run: bash iso-test/sim/shutdown.sh
+      - name: End-to-end healthcheck test
+        run: bash iso-test/sim/healthcheck.sh
 
   check_deny:
     needs: pre_job

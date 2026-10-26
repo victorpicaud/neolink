@@ -37,8 +37,10 @@ const CONNECTED: &str = "connected";
 /// What the broker says for neolink when it is gone, and what neolink says
 /// when it leaves
 const OFFLINE: &str = "offline";
-/// What neolink listens to
-const SUBSCRIPTIONS: [&str; 1] = ["neolink/#"];
+/// What neolink listens to: its config, and the cameras' commands. All of
+/// neolink/# brought back everything neolink publishes too, such as each
+/// camera's preview every few seconds, only to be dropped.
+const SUBSCRIPTIONS: [&str; 3] = ["neolink/config", "neolink/+/control/#", "neolink/+/query/#"];
 /// How many requests the client queues while the broker is away. Senders wait
 /// beyond that, rather than pile up previews.
 const REQUEST_CAPACITY: usize = 100;

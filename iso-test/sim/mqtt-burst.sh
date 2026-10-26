@@ -30,7 +30,7 @@ for _ in $(seq 1 30); do
 done
 
 # Far more than the 100 messages neolink buffers for its readers
-seq 1 5000 | mosquitto_pub "${MQTT[@]}" -t neolink/a/burst -l
+seq 1 5000 | mosquitto_pub "${MQTT[@]}" -t neolink/a/control/burst -l
 sleep 2
 
 if grep -qE "a: MQTT (stopped|failed|crashed), restarting" "$WORK/neolink.log"; then

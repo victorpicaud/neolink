@@ -60,7 +60,10 @@
 //! `credentials` are the username and password required to identify with the mqtt server
 //!
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use std::sync::Arc;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, PoisonError},
+};
 use tokio::{
     sync::mpsc::channel as mpsc,
     task::JoinSet,
@@ -128,15 +131,18 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
     ));
 
     // This threads prints the config
+    let own_configs = Arc::new(OwnConfigs::default());
     let mut thread_config = config.clone();
     let thread_instance = mqtt.subscribe("").await?;
     let thread_cancel = global_cancel.clone();
+    let thread_own_configs = own_configs.clone();
     set.spawn(async move {
         tokio::select! {
             _ = thread_cancel.cancelled() => AnyResult::Ok(()),
             v = async {
                 let mut curr_config = thread_config.borrow().clone();
                 let str = toml::to_string(&curr_config)?;
+                thread_own_configs.published(&str);
                 thread_instance.send_message("config", &str, true).await?;
                 loop {
                     curr_config = thread_config
@@ -144,6 +150,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                         .await?
                         .clone();
                     let str = toml::to_string(&curr_config)?;
+                    thread_own_configs.published(&str);
                     thread_instance.send_message("config", &str, true).await?;
                     log::trace!("UpdatedPosted config");
                 }
@@ -162,6 +169,16 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
             v = async {
                 while let Ok(msg) = thread_instance.recv().await {
                     if msg.topic == "config" {
+                        if own_configs.came_back(&msg.message) {
+                            continue;
+                        }
+                        // Not one the broker kept from before neolink
+                        // connected, such as neolink's own from its last run:
+                        // that could undo the config file
+                        if msg.retain {
+                            log::debug!("Ignoring the config the broker kept on neolink/config");
+                            continue;
+                        }
                         let config: Result<Config> = toml::from_str(&msg.message).with_context(|| {
                             format!("Failed to parse the MQTT {:?} config file", msg.topic)
                         });
@@ -174,37 +191,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                         let curr_config = thread_config.borrow().clone();
                         let mut config = config?;
 
-                        // Fill in skipped passwords
-                        if let (Some(mqtt), Some(curr_mqtt)) = (config.mqtt.as_mut(), curr_config.mqtt.as_ref()) {
-                            if mqtt.credentials.is_none() {
-                                mqtt.credentials = curr_mqtt.credentials.clone();
-                            }
-                            if mqtt.ca.is_none() {
-                                mqtt.ca = curr_mqtt.ca.clone();
-                            }
-                            if mqtt.client_auth.is_none() {
-                                mqtt.client_auth = curr_mqtt.client_auth.clone();
-                            }
-                        }
-                        for cam in config.cameras.iter_mut() {
-                            let name = cam.name.clone();
-                            let cur_cam = curr_config.cameras.iter().find(|c| c.name == name);
-                            if let Some(cur_cam) = cur_cam.as_ref() {
-                                if cam.password.is_none() {
-                                    cam.password = cur_cam.password.clone();
-                                }
-                            }
-                        }
-                        for user in config.users.iter_mut() {
-                            let name = user.name.clone();
-                            let cur_user = curr_config.users.iter().find(|c| c.name == name);
-                            if let Some(cur_user) = cur_user.as_ref() {
-                                if user.pass.is_none() {
-                                    user.pass = cur_user.pass.clone();
-                                }
-                            }
-                        }
-                        // Passwords should now be restored if they were not set
+                        fill_in_passwords(&mut config, &curr_config);
 
                         let validate = config.validate().with_context(|| {
                             format!("Failed to validate the MQTT {:?} config file", msg.topic)
@@ -246,6 +233,74 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
     }
     drop(cancel_drop);
     Err(first.err().unwrap_or_else(|| anyhow!("MQTT stopped")))
+}
+
+/// The configs neolink published on neolink/config that have not come back
+/// yet. Listening there, neolink hears its own as well, and took them for new
+/// ones: with two configs on their way, each one undid the other, endlessly.
+#[derive(Default)]
+struct OwnConfigs(Mutex<VecDeque<String>>);
+
+impl OwnConfigs {
+    /// How many are remembered, for those that never come back
+    const KEPT: usize = 16;
+
+    fn published(&self, config: &str) {
+        let mut configs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if configs.len() == Self::KEPT {
+            configs.pop_front();
+        }
+        configs.push_back(config.to_string());
+    }
+
+    /// Whether `config` is one of neolink's own, coming back. They come back
+    /// in the order they were published, so those before it never will.
+    fn came_back(&self, config: &str) -> bool {
+        let mut configs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match configs.iter().position(|own| own == config) {
+            Some(i) => {
+                configs.drain(..=i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Fills in the passwords that a config sent over MQTT leaves out, from the
+/// current config, but only for where they were meant for: whoever can
+/// publish a config could otherwise point a camera, or the broker, at a host
+/// of theirs, and have the password sent there. The CA and client certificate
+/// hold no secret, and the CA keeps a broker elsewhere on TLS.
+fn fill_in_passwords(config: &mut Config, current: &Config) {
+    if let (Some(mqtt), Some(curr_mqtt)) = (config.mqtt.as_mut(), current.mqtt.as_ref()) {
+        let same_broker = mqtt.broker_addr == curr_mqtt.broker_addr && mqtt.port == curr_mqtt.port;
+        if mqtt.credentials.is_none() && same_broker {
+            mqtt.credentials = curr_mqtt.credentials.clone();
+        }
+        if mqtt.ca.is_none() {
+            mqtt.ca = curr_mqtt.ca.clone();
+        }
+        if mqtt.client_auth.is_none() {
+            mqtt.client_auth = curr_mqtt.client_auth.clone();
+        }
+    }
+    for cam in config.cameras.iter_mut() {
+        if let Some(curr_cam) = current.cameras.iter().find(|c| c.name == cam.name) {
+            let same_camera =
+                cam.camera_addr == curr_cam.camera_addr && cam.camera_uid == curr_cam.camera_uid;
+            if cam.password.is_none() && same_camera {
+                cam.password = curr_cam.password.clone();
+            }
+        }
+    }
+    for user in config.users.iter_mut() {
+        if let Some(curr_user) = current.users.iter().find(|u| u.name == user.name) {
+            if user.pass.is_none() {
+                user.pass = curr_user.pass.clone();
+            }
+        }
+    }
 }
 
 async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> Result<()> {
@@ -1026,7 +1081,7 @@ async fn handle_mqtt_message(
             message,
         } => {
             let reply = match message.parse::<u64>() {
-                Ok(secs) => {
+                Ok(minutes) => {
                     if let Ok(permit) = camera.permit().await {
                         // This task waits for the `run_task` to send the OK then starts the countdown
                         // to drop the permit
@@ -1038,7 +1093,9 @@ async fn handle_mqtt_message(
                                 .run_task(|_cam| Box::pin(async move { AnyResult::Ok(()) }))
                                 .await;
 
-                            sleep(Duration::from_secs(secs * 60)).await;
+                            // At most a day: more overflowed, or kept a
+                            // battery camera awake for good
+                            sleep(Duration::from_secs(minutes.min(24 * 60) * 60)).await;
 
                             drop(permit);
                         });
@@ -1313,5 +1370,79 @@ mod tests {
         assert!(!is_unsupported(&anyhow::Error::from(
             neolink_core::Error::DroppedConnection
         )));
+    }
+
+    #[test]
+    fn neolink_knows_its_own_configs_when_they_come_back() {
+        let own = OwnConfigs::default();
+        own.published("a");
+        own.published("b");
+        assert!(!own.came_back("c"), "someone else's");
+        assert!(own.came_back("a"));
+        assert!(!own.came_back("a"), "the same again, from someone else");
+        assert!(own.came_back("b"));
+
+        own.published("d");
+        own.published("e");
+        assert!(own.came_back("e"));
+        assert!(!own.came_back("d"), "lost, since it did not come first");
+    }
+
+    #[test]
+    fn a_password_left_out_is_filled_in_only_for_where_it_was_meant_for() {
+        let config = |toml: &str| -> Config { toml::from_str(toml).unwrap() };
+        let current = config(
+            r#"
+            [mqtt]
+            broker_addr = "broker"
+            port = 1883
+            credentials = ["user", "secret"]
+
+            [[cameras]]
+            name = "same"
+            username = "admin"
+            address = "10.0.0.1:9000"
+            password = "secret"
+
+            [[cameras]]
+            name = "moved"
+            username = "admin"
+            address = "10.0.0.2:9000"
+            password = "secret"
+            "#,
+        );
+        // A config sent over MQTT, without the passwords
+        let from_mqtt = |broker: &str| {
+            let mut config = config(&format!(
+                r#"
+                [mqtt]
+                broker_addr = "{broker}"
+                port = 1883
+
+                [[cameras]]
+                name = "same"
+                username = "admin"
+                address = "10.0.0.1:9000"
+
+                [[cameras]]
+                name = "moved"
+                username = "admin"
+                address = "10.0.0.66:9000"
+                "#
+            ));
+            fill_in_passwords(&mut config, &current);
+            config
+        };
+
+        let same_broker = from_mqtt("broker");
+        assert_eq!(same_broker.cameras[0].password.as_deref(), Some("secret"));
+        assert_eq!(
+            same_broker.cameras[1].password, None,
+            "a camera moved elsewhere"
+        );
+        assert!(same_broker.mqtt.unwrap().credentials.is_some());
+
+        let broker_elsewhere = from_mqtt("elsewhere");
+        assert_eq!(broker_elsewhere.mqtt.unwrap().credentials, None);
     }
 }

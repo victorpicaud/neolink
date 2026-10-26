@@ -6,6 +6,8 @@ Usage: tcp_proxy.py LISTEN_PORT TARGET_PORT
 On SIGUSR1, it closes the connections of its clients, and leaves those to
 the server open and silent, as a network that fails between the two does.
 The server then only notices when the connection times out.
+
+On SIGUSR2, it stops letting clients connect, or lets them again.
 """
 import signal
 import socket
@@ -15,6 +17,7 @@ import threading
 dropped = []
 live = []
 lock = threading.Lock()
+refusing = False
 
 
 def pipe(source, sink):
@@ -46,9 +49,15 @@ def drop(*_):
         live.clear()
 
 
+def refuse(*_):
+    global refusing
+    refusing = not refusing
+
+
 def main() -> int:
     listen_port, target_port = int(sys.argv[1]), int(sys.argv[2])
     signal.signal(signal.SIGUSR1, drop)
+    signal.signal(signal.SIGUSR2, refuse)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", listen_port))
@@ -57,6 +66,9 @@ def main() -> int:
         try:
             client, _ = listener.accept()
         except InterruptedError:
+            continue
+        if refusing:
+            client.close()
             continue
         server = socket.create_connection(("127.0.0.1", target_port))
         with lock:

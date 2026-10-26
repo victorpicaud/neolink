@@ -5,6 +5,11 @@
 #     its camera still show as connected
 #   - a broker that restarts, and forgets everything, gets the state back,
 #     and commands still get answers
+#   - a config the broker kept from before neolink connected is not applied
+#   - two configs sent at once are applied once each, rather than each undoing
+#     the other endlessly
+#   - a config sent over MQTT that points a camera elsewhere does not send
+#     its password there
 #   - a broker CA that cannot be read stops neolink from connecting, rather
 #     than connecting without TLS
 # Needs python3 and mosquitto on PATH.
@@ -25,6 +30,9 @@ python3 "$ROOT/iso-test/sim/tcp_proxy.py" "$PROXY_PORT" "$MQTT_PORT" > "$WORK/pr
 PROXY_PID=$!
 PIDS+=("$PROXY_PID")
 start_fakecam m 20200 20210
+# Where a config sent over MQTT points the camera, and should not send its
+# password
+start_fakecam elsewhere 20201 20211
 {
   neolink_toml "$RTSP_PORT" "$PROXY_PORT" m=20200
   echo '[cameras.mqtt.discovery]'
@@ -72,14 +80,29 @@ else
   flunk "after a network failure, neolink shows as $status, and its camera as $camera"
 fi
 
-# The broker restarts, and has forgotten everything
+# The broker restarts, and has forgotten everything. Before neolink is
+# back, the broker is given a config without the camera to keep, as one
+# from an earlier run.
+kill -USR2 "$PROXY_PID"
 kill "$BROKER_PID"
 wait "$BROKER_PID" 2> /dev/null || true
 start_mosquitto "$MQTT_PORT"
+{
+  echo 'cameras = []'
+  neolink_toml "$RTSP_PORT" "$PROXY_PORT"
+} | mosquitto_pub "${MQTT[@]}" -t neolink/config -r -s
+kill -USR2 "$PROXY_PID"
 if wait_for_retained neolink/m/status connected 90; then
   echo "ok: the state came back after the broker restarted"
 else
   flunk "the state did not come back after the broker restarted: $(retained neolink/m/status)"
+fi
+sleep 2
+applied=$(grep -c "Updated config" "$WORK/neolink.log" || true)
+if [ "$applied" = 0 ]; then
+  echo "ok: a config the broker kept from before neolink connected was not applied"
+else
+  flunk "a config the broker kept from before neolink connected was applied, $applied times"
 fi
 
 # The handler answers on the command's own topic: OK, or FAIL here since the
@@ -93,6 +116,46 @@ if grep -qE "^(OK|FAIL)" "$WORK/led.out"; then
   echo "ok: commands still get answers after the broker restarted"
 else
   flunk "a command got no answer after the broker restarted: $(tr '\n' ' ' < "$WORK/led.out")"
+fi
+
+# Two configs sent at the same moment: neolink hears its own when it
+# publishes them back, and should not take those for new ones
+for backoff in 5 7; do
+  {
+    neolink_toml "$RTSP_PORT" "$PROXY_PORT" m=20200
+    echo "max_reconnect_backoff = $backoff"
+  } > "$WORK/config-$backoff.toml"
+done
+mosquitto_pub "${MQTT[@]}" -t neolink/config -f "$WORK/config-5.toml" &
+first=$!
+mosquitto_pub "${MQTT[@]}" -t neolink/config -f "$WORK/config-7.toml"
+wait "$first" || true
+sleep 5
+applied=$(grep -c "Updated config" "$WORK/neolink.log" || true)
+if [ "$applied" -le 2 ]; then
+  echo "ok: two configs sent at once were applied once each"
+else
+  flunk "two configs sent at once were applied $applied times"
+fi
+
+# A config sent over MQTT that points the camera elsewhere, and leaves its
+# password out
+{
+  neolink_toml "$RTSP_PORT" "$PROXY_PORT"
+  camera_toml m 20201 | grep -v '^password'
+} | mosquitto_pub "${MQTT[@]}" -t neolink/config -s
+for _ in $(seq 1 30); do
+  if grep -q "login \(accepted\|rejected\)" "$WORK/fakecam-elsewhere.log"; then
+    break
+  fi
+  sleep 1
+done
+if grep -q "login accepted" "$WORK/fakecam-elsewhere.log"; then
+  flunk "a config sent over MQTT sent the camera's password elsewhere"
+elif grep -q "login rejected" "$WORK/fakecam-elsewhere.log"; then
+  echo "ok: a camera pointed elsewhere over MQTT did not get its password"
+else
+  flunk "the camera pointed elsewhere over MQTT never went there"
 fi
 
 # A neolink with a CA it cannot read, and a broker of its own, so that any

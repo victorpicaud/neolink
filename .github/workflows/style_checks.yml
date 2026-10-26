@@ -9,6 +9,7 @@ jobs:
   pre_job:
     # continue-on-error: true # Uncomment once integration is finished
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # Map a step output to a job output
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
@@ -25,12 +26,14 @@ jobs:
     if: needs.pre_job.outputs.should_skip != 'true'
     name: Clippy
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: apt install gstreamer and deps
+        timeout-minutes: 15
         run: |
-          sudo apt update
-          sudo apt install -y aptitude
+          sudo apt -o Acquire::Retries=3 update
+          sudo apt -o Acquire::Retries=3 install -y aptitude
           sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler
       - name: Run clippy
         run: |
@@ -48,6 +51,7 @@ jobs:
     if: needs.pre_job.outputs.should_skip != 'true'
     name: Rust-fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: rustfmt
@@ -58,12 +62,14 @@ jobs:
     if: needs.pre_job.outputs.should_skip != 'true'
     name: Tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: apt install gstreamer and deps
+        timeout-minutes: 15
         run: |
-          sudo apt update
-          sudo apt install -y --no-install-recommends \
+          sudo apt -o Acquire::Retries=3 update
+          sudo apt -o Acquire::Retries=3 install -y --no-install-recommends \
             libgstrtspserver-1.0-dev libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
@@ -119,6 +125,7 @@ jobs:
     if: needs.pre_job.outputs.should_skip != 'true'
     name: cargo-deny
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -132,6 +139,7 @@ jobs:
     if: needs.pre_job.outputs.should_skip != 'true'
     name: Luacheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Run luacheck

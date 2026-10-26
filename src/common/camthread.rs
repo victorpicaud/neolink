@@ -17,6 +17,8 @@ pub(crate) enum NeoCamThreadState {
 pub(crate) struct NeoCamThread {
     state: WatchReceiver<NeoCamThreadState>,
     config: WatchReceiver<CameraConfig>,
+    /// Counts the requests to reconnect
+    reconnect: WatchReceiver<u64>,
     cancel: CancellationToken,
     camera_watch: WatchSender<Weak<BcCamera>>,
 }
@@ -25,12 +27,14 @@ impl NeoCamThread {
     pub(crate) async fn new(
         watch_state_rx: WatchReceiver<NeoCamThreadState>,
         watch_config_rx: WatchReceiver<CameraConfig>,
+        reconnect_rx: WatchReceiver<u64>,
         camera_watch_tx: WatchSender<Weak<BcCamera>>,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             state: watch_state_rx,
             config: watch_config_rx,
+            reconnect: reconnect_rx,
             cancel,
             camera_watch: camera_watch_tx,
         }
@@ -122,9 +126,16 @@ impl NeoCamThread {
             let name = config.name.clone();
 
             let mut state = self.state.clone();
+            // Only the requests from now on
+            let mut reconnect = self.reconnect.clone();
+            let requests = *reconnect.borrow();
 
             let res = tokio::select! {
                 Ok(_) = config_rec.changed() => {
+                    None
+                }
+                Ok(_) = reconnect.wait_for(|now| *now != requests) => {
+                    log::info!("{name}: Reconnecting");
                     None
                 }
                 Ok(_) = state.wait_for(|state| matches!(state, NeoCamThreadState::Disconnected)) => {

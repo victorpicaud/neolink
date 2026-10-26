@@ -36,6 +36,9 @@ pub struct Shared {
     /// Set by the `motion` command and cleared by `still`. Every client that
     /// asked for motion alarms is told of each change.
     pub motion: watch::Sender<bool>,
+    /// Incremented by the `drop` command: the video streams running then stop
+    /// without a word, while new ones run as usual.
+    pub drop_video: watch::Sender<u64>,
 }
 
 impl Shared {
@@ -45,6 +48,7 @@ impl Shared {
             mode: watch::Sender::new(mode),
             kill: watch::Sender::new(0),
             motion: watch::Sender::new(false),
+            drop_video: watch::Sender::new(0),
         }
     }
 }
@@ -594,6 +598,7 @@ pub async fn serve(
     let kill_epoch = *kill.borrow_and_update();
     let mode = shared.mode.subscribe();
     let mut motion = shared.motion.subscribe();
+    let mut drop_video = shared.drop_video.subscribe();
 
     let mut conn = Conn {
         cfg,
@@ -616,6 +621,12 @@ pub async fn serve(
                 if *kill.borrow() != kill_epoch {
                     info!("die: dropping connection {peer:?}");
                     break Ok(());
+                }
+            }
+            Ok(()) = drop_video.changed() => {
+                for (msg_num, handle) in conn.video.drain() {
+                    info!("drop: video {msg_num} stops without a word");
+                    handle.abort();
                 }
             }
             Ok(()) = motion.changed() => {

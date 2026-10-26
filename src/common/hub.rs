@@ -5,6 +5,7 @@
 //! anyone subscribes, pauses it as the config asks, and hands its frames to
 //! every subscriber. It keeps the frames since the last keyframe, so that a new
 //! client can show a picture at once.
+use anyhow::anyhow;
 use futures::{future::BoxFuture, FutureExt};
 use neolink_core::{
     bc_protocol::StreamKind,
@@ -43,6 +44,13 @@ const MAX_CACHED_BYTES: usize = 8 * 1024 * 1024;
 /// that stopped sending frames would otherwise show new clients a picture from
 /// before it stopped as if it were live.
 const STALE_AFTER: Duration = Duration::from_secs(3);
+/// How long a stream that someone watches may go without video before it is
+/// restarted. A camera can stop sending video while it answers everything
+/// else, and its clients then froze until they reconnected.
+const VIDEO_TIMEOUT: Duration = Duration::from_secs(15);
+/// After this many restarts in a row that brought no video back, the camera
+/// is reconnected
+const RESTARTS_BEFORE_RECONNECT: u32 = 2;
 
 /// What a hub sends its subscribers
 #[derive(Clone)]
@@ -54,10 +62,21 @@ enum HubEvent {
     Reconfigured,
 }
 
+/// What a camera stream sends its hub
+enum SourceEvent {
+    /// The camera accepted the stream: video should follow. Until then, it
+    /// may not even be connected.
+    Started,
+    Frame(BcMedia),
+}
+
 /// Runs the camera stream, sending its frames, until it ends or fails. It is
 /// stopped by dropping the future.
 type StreamSource =
-    Box<dyn Fn(mpsc::Sender<BcMedia>) -> BoxFuture<'static, AnyResult<()>> + Send + Sync>;
+    Box<dyn Fn(mpsc::Sender<SourceEvent>) -> BoxFuture<'static, AnyResult<()>> + Send + Sync>;
+
+/// Reconnects to the camera
+type Reconnect = Box<dyn Fn() + Send + Sync>;
 
 #[derive(Clone, Copy, Default)]
 struct Subscribers {
@@ -229,12 +248,31 @@ impl StreamHub {
             config.clone(),
             gate_tx,
         ));
-        Self::new(name, camera_source(instance, config, stream), gate)
+        let reconnect_instance = instance.clone();
+        let reconnect: Reconnect = Box::new(move || {
+            let instance = reconnect_instance.clone();
+            tokio::task::spawn(async move {
+                if let Err(e) = instance.reconnect().await {
+                    log::debug!("Could not reconnect the camera: {e:#}");
+                }
+            });
+        });
+        Self::new(
+            name,
+            camera_source(instance, config, stream),
+            gate,
+            reconnect,
+        )
     }
 
     /// Runs `source` while anyone subscribes and `gate` is open, or a new
     /// subscriber still needs frames
-    fn new(name: String, source: StreamSource, gate: watch::Receiver<bool>) -> Self {
+    fn new(
+        name: String,
+        source: StreamSource,
+        gate: watch::Receiver<bool>,
+        reconnect: Reconnect,
+    ) -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let cache = Arc::new(Mutex::new(Cache {
             events,
@@ -248,7 +286,7 @@ impl StreamHub {
         Self {
             cache: Arc::downgrade(&cache),
             subscribers: Arc::new(subscribers),
-            task: tokio::task::spawn(run(name, cache, source, subscribed, gate)),
+            task: tokio::task::spawn(run(name, cache, source, subscribed, gate, reconnect)),
         }
     }
 
@@ -292,8 +330,11 @@ async fn run(
     source: StreamSource,
     mut subscribers: watch::Receiver<Subscribers>,
     mut gate: watch::Receiver<bool>,
+    reconnect: Reconnect,
 ) {
     let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+    // Restarts in a row that brought no video back
+    let mut restarts = 0;
     let mut joined = 0;
     // Someone subscribed since the last keyframe. They need frames to learn
     // the stream type and show a picture, even while the stream is paused.
@@ -323,16 +364,29 @@ async fn run(
         let mut stream = source(frames_tx);
         let mut warm_until = None;
         let mut idle_since = None;
+        // When video last came, or the camera accepted the stream
+        let mut last_video = None;
         let stopped = loop {
             if !*gate.borrow_and_update() && !warming && warm_until.is_none() {
                 break Stopped::Unwanted;
             }
             tokio::select! {
                 biased;
-                Some(frame) = frames.recv() => {
+                Some(event) = frames.recv() => {
+                    let frame = match event {
+                        SourceEvent::Started => {
+                            last_video = Some(Instant::now());
+                            continue;
+                        }
+                        SourceEvent::Frame(frame) => frame,
+                    };
                     if warming && matches!(frame, BcMedia::Iframe(_)) {
                         warming = false;
                         warm_until = Some(Instant::now() + WARM_UP);
+                    }
+                    if matches!(frame, BcMedia::Iframe(_) | BcMedia::Pframe(_)) {
+                        last_video = Some(Instant::now());
+                        restarts = 0;
                     }
                     cache.lock().unwrap_or_else(PoisonError::into_inner).publish(frame);
                 }
@@ -356,6 +410,14 @@ async fn run(
                 },
                 _ = until(warm_until) => warm_until = None,
                 _ = until(idle_since.map(|since| since + LINGER)) => break Stopped::Unwanted,
+                // Only for someone watching
+                _ = until(last_video.map(|last| last + VIDEO_TIMEOUT)), if idle_since.is_none() => {
+                    restarts += 1;
+                    break Stopped::Ended(Err(anyhow!(
+                        "No video for {}s",
+                        VIDEO_TIMEOUT.as_secs()
+                    )));
+                }
             }
         };
         drop(stream);
@@ -365,8 +427,16 @@ async fn run(
             Stopped::Unwanted => {
                 log::debug!("{name}: Stopped the camera stream");
                 backoff.reset();
+                restarts = 0;
             }
             Stopped::Ended(result) => {
+                if restarts >= RESTARTS_BEFORE_RECONNECT {
+                    log::warn!(
+                        "{name}: Restarting the stream brought no video back, reconnecting to the camera"
+                    );
+                    reconnect();
+                    restarts = 0;
+                }
                 if started.elapsed() >= HEALTHY_RUN {
                     backoff.reset();
                 }
@@ -399,21 +469,24 @@ fn camera_source(
     config: watch::Receiver<CameraConfig>,
     stream: StreamKind,
 ) -> StreamSource {
-    Box::new(move |frames| {
+    Box::new(move |events| {
         let instance = instance.clone();
         let config = config.clone();
         async move {
             instance
                 .run_task(move |cam| {
-                    let frames = frames.clone();
+                    let events = events.clone();
                     // Read on every run: a changed config reconnects the
                     // camera, which runs this again
                     let strict = config.borrow().strict;
                     Box::pin(async move {
                         let mut media = cam.start_video(stream, 0, strict).await?;
+                        if events.send(SourceEvent::Started).await.is_err() {
+                            return Ok(());
+                        }
                         loop {
                             let frame = media.get_data().await??;
-                            if frames.send(frame).await.is_err() {
+                            if events.send(SourceEvent::Frame(frame)).await.is_err() {
                                 break AnyResult::Ok(());
                             }
                         }
@@ -555,8 +628,7 @@ impl MotionAlerts {
 mod tests {
     use super::*;
     use crate::common::NeoCamCommand;
-    use anyhow::anyhow;
-    use neolink_core::bcmedia::model::{BcMediaIframe, BcMediaPframe};
+    use neolink_core::bcmedia::model::{BcMediaAac, BcMediaIframe, BcMediaPframe};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
 
@@ -611,12 +683,13 @@ mod tests {
         let (frames, _) = broadcast::channel(1024);
         let source_starts = starts.clone();
         let source_frames = frames.clone();
-        let source: StreamSource = Box::new(move |out: mpsc::Sender<BcMedia>| {
+        let source: StreamSource = Box::new(move |out: mpsc::Sender<SourceEvent>| {
             source_starts.fetch_add(1, Ordering::SeqCst);
             let mut frames = source_frames.subscribe();
             async move {
+                out.send(SourceEvent::Started).await?;
                 while let Ok(frame) = frames.recv().await {
-                    out.send(frame).await?;
+                    out.send(SourceEvent::Frame(frame)).await?;
                 }
                 Ok(())
             }
@@ -626,13 +699,38 @@ mod tests {
     }
 
     fn hub(source: StreamSource, open: bool) -> (StreamHub, watch::Sender<bool>) {
+        let (hub, gate, _) = hub_reconnecting(source, open);
+        (hub, gate)
+    }
+
+    /// A hub, and how many times it reconnected the camera
+    fn hub_reconnecting(
+        source: StreamSource,
+        open: bool,
+    ) -> (StreamHub, watch::Sender<bool>, Arc<AtomicUsize>) {
         let (gate, gated) = watch::channel(open);
-        (StreamHub::new("test".to_string(), source, gated), gate)
+        let reconnects = Arc::new(AtomicUsize::new(0));
+        let counted = reconnects.clone();
+        let reconnect: Reconnect = Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let hub = StreamHub::new("test".to_string(), source, gated, reconnect);
+        (hub, gate, reconnects)
     }
 
     async fn settle() {
         for _ in 0..20 {
             tokio::task::yield_now().await;
+        }
+    }
+
+    /// Lets `duration` pass with the camera sending a frame a second while it
+    /// streams
+    async fn stream_for(camera: &Camera, duration: Duration) {
+        let end = Instant::now() + duration;
+        while Instant::now() < end {
+            let _ = camera.frames.send(iframe(0));
+            sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -653,7 +751,7 @@ mod tests {
         // It lingers for a client that comes straight back
         sleep(LINGER / 2).await;
         let back = hub.subscribe().unwrap();
-        sleep(LINGER * 2).await;
+        stream_for(&camera, LINGER * 2).await;
         assert_eq!(camera.starts(), 1);
         assert!(camera.streaming());
 
@@ -844,6 +942,66 @@ mod tests {
             Err(broadcast::error::RecvError::Closed)
         ));
         assert!(hub.subscribe().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_stops_sending_video_is_restarted() {
+        let (camera, source) = camera();
+        let (hub, _gate, reconnects) = hub_reconnecting(source, true);
+        let _subscription = hub.subscribe().unwrap();
+        settle().await;
+        camera.frames.send(iframe(1)).unwrap();
+        settle().await;
+        sleep(VIDEO_TIMEOUT / 2).await;
+        assert_eq!(camera.starts(), 1);
+
+        sleep(VIDEO_TIMEOUT).await;
+        assert_eq!(camera.starts(), 2, "restarted once video stopped");
+        camera.frames.send(iframe(2)).unwrap();
+        settle().await;
+        sleep(VIDEO_TIMEOUT / 2).await;
+        camera.frames.send(iframe(3)).unwrap();
+        settle().await;
+        sleep(VIDEO_TIMEOUT / 2).await;
+        assert_eq!(camera.starts(), 2, "video came back");
+        assert_eq!(reconnects.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restarts_that_bring_no_video_back_reconnect_the_camera() {
+        // A camera that accepts the stream, and sends no video
+        let starts = Arc::new(AtomicUsize::new(0));
+        let counted = starts.clone();
+        let source: StreamSource = Box::new(move |out: mpsc::Sender<SourceEvent>| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async move {
+                out.send(SourceEvent::Started).await?;
+                let audio = BcMedia::Aac(BcMediaAac { data: vec![] });
+                out.send(SourceEvent::Frame(audio)).await?;
+                std::future::pending::<AnyResult<()>>().await
+            }
+            .boxed()
+        });
+        let (hub, _gate, reconnects) = hub_reconnecting(source, true);
+        let _subscription = hub.subscribe().unwrap();
+        // Two restarts, and the third under way: the second reconnect is
+        // due at 60s at the earliest
+        sleep(VIDEO_TIMEOUT * 7 / 2).await;
+
+        assert!(starts.load(Ordering::SeqCst) >= 3);
+        assert_eq!(reconnects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_camera_that_never_answers_is_not_reconnected_by_the_hub() {
+        // It never accepts the stream: the connection itself is not up, which
+        // is not the stream's to fix
+        let source: StreamSource =
+            Box::new(|_| async { std::future::pending::<AnyResult<()>>().await }.boxed());
+        let (hub, _gate, reconnects) = hub_reconnecting(source, true);
+        let _subscription = hub.subscribe().unwrap();
+        sleep(VIDEO_TIMEOUT * 4).await;
+        assert_eq!(reconnects.load(Ordering::SeqCst), 0);
     }
 
     fn camera_config(on_motion: bool) -> CameraConfig {

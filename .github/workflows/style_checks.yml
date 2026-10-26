@@ -91,6 +91,8 @@ jobs:
         run: bash iso-test/sim/shared-stream.sh
       - name: End-to-end stream timing test
         run: bash iso-test/sim/stream-timing.sh
+      - name: End-to-end stalled stream test
+        run: bash iso-test/sim/stalled-stream.sh
       - name: End-to-end config reload test (over MQTT)
         run: bash iso-test/sim/config-reload.sh
       - name: End-to-end MQTT burst test

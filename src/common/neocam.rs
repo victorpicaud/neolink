@@ -45,6 +45,8 @@ pub(crate) enum NeoCamCommand {
     #[cfg(feature = "pushnoti")]
     PushNoti(OneshotSender<WatchReceiver<Option<PushNoti>>>),
     GetUid(OneshotSender<String>),
+    /// Reconnect to the camera
+    Reconnect(OneshotSender<()>),
     /// A subscription to the camera's stream, which runs once for all of them
     #[cfg(feature = "gstreamer")]
     Stream(StreamKind, OneshotSender<Option<HubSubscription>>),
@@ -68,6 +70,7 @@ impl NeoCam {
         let (camera_watch_tx, camera_watch_rx) = watch(Weak::new());
         let (md_request_tx, md_request_rx) = mpsc(100);
         let (state_tx, state_rx) = watch(NeoCamThreadState::Connected);
+        let (reconnect_tx, reconnect_rx) = watch(0u64);
         let (uid_tx, uid_rx) = watch(config.camera_uid.clone());
 
         let set = JoinSet::new();
@@ -142,6 +145,10 @@ impl NeoCam {
                             NeoCamCommand::State(sender) => {
                                 let _ = sender.send(*state_tx.borrow());
                             }
+                            NeoCamCommand::Reconnect(sender) => {
+                                reconnect_tx.send_modify(|requests| *requests += 1);
+                                let _ = sender.send(());
+                            }
                             NeoCamCommand::GetPermit(sender) => {
                                 let _ = sender.send(users.create_activated().await?);
                             }
@@ -204,6 +211,7 @@ impl NeoCam {
         let mut cam_thread = NeoCamThread::new(
             state_rx,
             thread_watch_config_rx,
+            reconnect_rx,
             camera_watch_tx,
             me.cancel.clone(),
         )

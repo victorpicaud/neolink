@@ -268,6 +268,16 @@ impl NeoInstance {
         Ok(instance_rx.await?)
     }
 
+    /// Drops the connection to the camera, and connects again
+    #[cfg(feature = "gstreamer")]
+    pub(crate) async fn reconnect(&self) -> Result<()> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::Reconnect(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
     pub(crate) async fn disconnect(&self) -> Result<()> {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control

@@ -395,7 +395,16 @@ impl NeoCam {
     }
 
     pub(crate) async fn update_config(&self, config: CameraConfig) -> Result<()> {
-        self.config_watch.send_replace(config);
+        // Every config update reaches every camera, and a camera told of a
+        // change reconnects, so only tell it when its own config changed
+        self.config_watch.send_if_modified(|current| {
+            if *current != config {
+                *current = config;
+                true
+            } else {
+                false
+            }
+        });
         Ok(())
     }
 }
@@ -411,5 +420,37 @@ impl Drop for NeoCam {
             while set.join_next().await.is_some() {}
             log::trace!("Dropped NeoCam");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera_config(use_splash: bool) -> CameraConfig {
+        let config: crate::config::Config = toml::from_str(&format!(
+            "[[cameras]]\nname = \"cam\"\nusername = \"admin\"\naddress = \"127.0.0.1:1\"\nuse_splash = {use_splash}\n"
+        ))
+        .unwrap();
+        config.cameras[0].clone()
+    }
+
+    #[tokio::test]
+    async fn only_a_changed_config_reaches_the_camera() -> AnyResult<()> {
+        #[cfg(feature = "pushnoti")]
+        let camera = NeoCam::new(camera_config(true), tokio::sync::mpsc::channel(1).0).await?;
+        #[cfg(not(feature = "pushnoti"))]
+        let camera = NeoCam::new(camera_config(true)).await?;
+        let mut config = camera.subscribe().await?.config().await?;
+        config.borrow_and_update();
+
+        camera.update_config(camera_config(true)).await?;
+        assert!(
+            !config.has_changed()?,
+            "an unchanged config must not disturb the camera"
+        );
+        camera.update_config(camera_config(false)).await?;
+        assert!(config.has_changed()?);
+        Ok(())
     }
 }

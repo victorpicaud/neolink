@@ -2,6 +2,8 @@
 # Cameras come and go with a config published over MQTT, as Home Assistant or
 # a user would send it:
 #   - a camera removed from the config is no longer served
+#   - its clients are disconnected, even one that ignores RTCP BYE and only
+#     notices a closed connection
 #   - the other camera keeps streaming meanwhile, without reconnecting
 #   - a camera added back is served again
 #   - `neolink mqtt` and `neolink mqtt-rtsp` without an [mqtt] section stop
@@ -32,11 +34,19 @@ wait_for_codec "$URL/a/main" h264
 wait_for_codec "$URL/b/main" h264
 b_connections=$(grep -c "b: Connecting to camera" "$WORK/neolink.log")
 
+python3 "$ROOT/iso-test/sim/rtsp_client.py" "$URL/a/main" 30 > "$WORK/held.log" 2>&1 &
+HELD=$!
+sleep 3
 publish_config b=19201
 if wait_for_answer "$URL/a/main" "404 Not Found" 30; then
   echo "ok: a camera removed from the config is no longer served"
 else
   flunk "a camera removed from the config is still served"
+fi
+if wait "$HELD"; then
+  echo "ok: its client was disconnected ($(tail -n 1 "$WORK/held.log"))"
+else
+  flunk "its client was not disconnected: $(tail -n 1 "$WORK/held.log")"
 fi
 if out=$(probe "$URL/b/main" 15) && echo "$out" | grep -qx h264; then
   echo "ok: the other camera keeps streaming"

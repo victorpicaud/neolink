@@ -164,6 +164,37 @@ impl NeoRtspServer {
         }
     }
 
+    /// Disconnects the clients that play `element`, so that they start
+    /// again. Ending their media is not enough: a client can stay connected,
+    /// waiting for data that never comes.
+    pub(crate) fn close_clients_of(&self, element: &gstreamer::Element) {
+        let server = self.clone();
+        let element = element.clone();
+        // On the main loop, which serves the clients
+        glib::MainContext::default().invoke(move || {
+            let clients = server.client_filter(Some(&mut |_, client| {
+                let mut plays = false;
+                client.session_filter(Some(&mut |_, session| {
+                    session.filter(Some(&mut |_, session_media| {
+                        plays |= session_media
+                            .media()
+                            .is_some_and(|media| media.element() == element);
+                        RTSPFilterResult::Keep
+                    }));
+                    RTSPFilterResult::Keep
+                }));
+                if plays {
+                    RTSPFilterResult::Ref
+                } else {
+                    RTSPFilterResult::Keep
+                }
+            }));
+            for client in clients {
+                client.close();
+            }
+        });
+    }
+
     pub(crate) fn set_up_tls(&self, config: &Config) -> AnyResult<()> {
         self.imp().set_up_tls(config)
     }
@@ -292,6 +323,16 @@ impl NeoRtspServerImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtsp::gst::NeoMediaFactory;
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        sync::{Arc, Mutex},
+    };
+
+    /// The servers share GLib's default main context, which only one main
+    /// loop at a time can run
+    static MAIN_CONTEXT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn a_port_in_use_fails_startup() -> AnyResult<()> {
@@ -309,8 +350,109 @@ mod tests {
         Ok(())
     }
 
+    /// Sends an RTSP request, and returns the reply's head
+    fn request(socket: &mut TcpStream, request: &str) -> String {
+        socket.write_all(request.as_bytes()).unwrap();
+        let mut reply = vec![];
+        let mut byte = [0];
+        while !reply.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).unwrap();
+            reply.push(byte[0]);
+        }
+        let reply = String::from_utf8(reply).unwrap();
+        let body: usize = reply
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .map_or(0, |length| length.parse().unwrap());
+        socket.read_exact(&mut vec![0; body]).unwrap();
+        reply
+    }
+
+    #[tokio::test]
+    async fn the_clients_of_a_pipeline_can_be_disconnected() -> AnyResult<()> {
+        let _context = MAIN_CONTEXT.lock().await;
+        gstreamer::init()?;
+        let server = NeoRtspServer::new()?;
+        let built = Arc::new(Mutex::new(None));
+        let factory_built = built.clone();
+        let factory = NeoMediaFactory::new_with_callback(move || {
+            let bin = gstreamer::parse::bin_from_description(
+                "videotestsrc is-live=true ! jpegenc ! rtpjpegpay name=pay0",
+                false,
+            )?
+            .upcast::<gstreamer::Element>();
+            *factory_built.lock().unwrap() = Some(bin.clone());
+            Ok(bin)
+        });
+        factory.add_permitted_roles(&HashSet::from(["anonymous"]));
+        server
+            .mount_points()
+            .context("no mount points")?
+            .add_factory("/test", factory);
+        let running = server.run("127.0.0.1", 0).await?;
+        let port = server.bound_port();
+        let url = format!("rtsp://127.0.0.1:{port}/test");
+
+        let client = tokio::task::spawn_blocking(move || {
+            let mut socket = TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+            request(
+                &mut socket,
+                &format!("DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n"),
+            );
+            let setup = request(
+                &mut socket,
+                &format!(
+                    "SETUP {url}/stream=0 RTSP/1.0\r\nCSeq: 2\r\n\
+                     Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"
+                ),
+            );
+            let session = setup
+                .lines()
+                .find_map(|line| line.strip_prefix("Session: "))
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_string();
+            request(
+                &mut socket,
+                &format!("PLAY {url} RTSP/1.0\r\nCSeq: 3\r\nSession: {session}\r\n\r\n"),
+            );
+            socket
+        })
+        .await?;
+
+        let element = built.lock().unwrap().clone().context("no pipeline")?;
+        server.close_clients_of(&element);
+        let closed = tokio::task::spawn_blocking(move || {
+            let mut socket = client;
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .unwrap();
+            let mut data = vec![0; 65536];
+            // The video keeps coming until the connection closes
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match socket.read(&mut data) {
+                    Ok(0) => return true,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(_) => return true,
+                }
+            }
+            false
+        })
+        .await?;
+        drop(running);
+        server.join().await?;
+        assert!(closed, "the client is still connected");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_main_loop_stops_when_its_guard_is_dropped() -> AnyResult<()> {
+        let _context = MAIN_CONTEXT.lock().await;
         let server = NeoRtspServer::new()?;
         // Quit before the loop had a chance to start
         drop(server.run("127.0.0.1", 0).await?);

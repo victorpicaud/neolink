@@ -1,5 +1,6 @@
-use gstreamer::ClockTime;
+use gstreamer::{glib, ClockTime, PadProbeReturn, PadProbeType};
 use std::sync::{
+    atomic::{AtomicI64, Ordering},
     mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender},
     Arc, Mutex, PoisonError,
 };
@@ -21,7 +22,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{
+    common::NeoInstance,
+    rtsp::gst::{NeoMediaFactory, NeoRtspServer},
+    AnyResult,
+};
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -171,17 +176,25 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(20);
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
+    server: NeoRtspServer,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     let config = camera.config().await?;
     let name = config.borrow().name.clone();
     let (client_tx, mut client_rx) = mpsc::<ClientRequest>(100);
+    let close: CloseClient = Arc::new(move |element: &Element| server.close_clients_of(element));
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn({
         let name = name.clone();
         async move {
             while let Some(request) = client_rx.recv().await {
                 log::debug!("New client for {name}::{stream}");
-                tokio::task::spawn(serve_client(camera.clone(), name.clone(), stream, request));
+                tokio::task::spawn(serve_client(
+                    camera.clone(),
+                    name.clone(),
+                    stream,
+                    request,
+                    close.clone(),
+                ));
             }
             AnyResult::Ok(())
         }
@@ -299,6 +312,9 @@ impl ClientReply {
     }
 }
 
+/// Disconnects the clients that play a pipeline
+type CloseClient = Arc<dyn Fn(&Element) + Send + Sync>;
+
 /// Starts the camera stream for one client and builds its pipeline. Frames
 /// only flow if the client is still waiting; otherwise everything is dropped,
 /// which stops the camera stream again.
@@ -307,6 +323,7 @@ async fn serve_client(
     name: String,
     stream: StreamKind,
     request: ClientRequest,
+    close: CloseClient,
 ) {
     let built = tokio::select! {
         _ = request.abandoned() => {
@@ -319,7 +336,7 @@ async fn serve_client(
         Ok(client) => {
             log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
             if request.deliver(Ok(client.element.clone())) {
-                client.start_pump(name, stream);
+                client.start_pump(name, stream, close);
             }
         }
         Err(e) => {
@@ -333,6 +350,9 @@ struct ClientPipeline {
     element: Element,
     vid_src: Option<AppSrc>,
     aud_src: Option<AppSrc>,
+    /// When video last left the pipeline, in GLib's monotonic microseconds.
+    /// Zero until it does.
+    egress: Arc<AtomicI64>,
     /// The frames received while learning the stream type
     buffered: Vec<BcMedia>,
     media_rx: MpscReceiver<BcMedia>,
@@ -395,13 +415,40 @@ async fn prepare_client(
         );
     }
 
+    let egress = Arc::new(AtomicI64::new(0));
+    if vid_src.is_some() {
+        watch_egress(&element, &egress);
+    }
+
     Ok(ClientPipeline {
         element,
         vid_src,
         aud_src,
+        egress,
         buffered,
         media_rx,
     })
+}
+
+/// Keeps `egress` at when video last left the pipeline, from its payloader.
+/// A payloader can send buffer lists, which a probe for buffers alone misses.
+fn watch_egress(element: &Element, egress: &Arc<AtomicI64>) {
+    let payloader = element
+        .downcast_ref::<Bin>()
+        .and_then(|bin| bin.by_name("pay0"))
+        .and_then(|payloader| payloader.static_pad("src"));
+    let Some(pad) = payloader else {
+        log::debug!("No video payloader to watch");
+        return;
+    };
+    let egress = egress.clone();
+    pad.add_probe(
+        PadProbeType::BUFFER | PadProbeType::BUFFER_LIST,
+        move |_, _| {
+            egress.store(glib::monotonic_time(), Ordering::Relaxed);
+            PadProbeReturn::Ok
+        },
+    );
 }
 
 /// How often a client's pump checks that the client is still there while no
@@ -412,25 +459,47 @@ const LIVENESS_CHECK: Duration = Duration::from_secs(1);
 /// How long a client may look gone before its pump stops: GStreamer adds the
 /// pipeline to the client's media only after the pump has started
 const GONE_GRACE: Duration = Duration::from_secs(3);
+/// How long a playing client's pipeline may hold back the frames that keep
+/// coming before the client is disconnected, so that it starts again. Its
+/// stream froze for good otherwise.
+const EGRESS_TIMEOUT: Duration = Duration::from_secs(20);
+/// Frames count as coming if one came this recently
+const FRAMES_COMING: Duration = Duration::from_secs(5);
+
+/// Whether a playing client's pipeline holds back the frames that keep
+/// coming. All in GLib's monotonic microseconds.
+fn egress_stalled(now: i64, playing_since: Option<i64>, last_out: i64, last_in: i64) -> bool {
+    let timeout = EGRESS_TIMEOUT.as_micros() as i64;
+    playing_since.is_some_and(|since| now - since >= timeout)
+        && now - last_out >= timeout
+        && now - last_in < FRAMES_COMING.as_micros() as i64
+}
 
 impl ClientPipeline {
     /// Sends the camera's frames into the pipeline until the client is gone,
     /// which lets go of the camera stream
-    fn start_pump(self, name: String, stream: StreamKind) {
-        tokio::task::spawn(self.pump(name, stream));
+    fn start_pump(self, name: String, stream: StreamKind, close: CloseClient) {
+        tokio::task::spawn(self.pump(name, stream, close));
     }
 
-    async fn pump(self, name: String, stream: StreamKind) {
+    async fn pump(self, name: String, stream: StreamKind, close: CloseClient) {
         let ClientPipeline {
             element,
             vid_src,
             aud_src,
+            egress,
             buffered,
             mut media_rx,
         } = self;
         // GStreamer holds the pipeline while the client is there. Holding it
         // here too would keep the client looking connected after it left.
+        let pipeline = element.downgrade();
         drop(element);
+        let close_client = || {
+            if let Some(element) = pipeline.upgrade() {
+                close(&element);
+            }
+        };
         if vid_src.is_none() && aud_src.is_none() {
             // The splash screen: nothing to send it
             return;
@@ -443,6 +512,8 @@ impl ClientPipeline {
         let mut liveness = interval(LIVENESS_CHECK);
         liveness.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut gone_since = None;
+        let mut playing_since = None;
+        let mut last_in = 0;
         let mut buffered = buffered.into_iter();
         loop {
             let frame = match buffered.next() {
@@ -456,6 +527,7 @@ impl ClientPipeline {
                             for app in vid_src.iter().chain(aud_src.iter()) {
                                 let _ = app.end_of_stream();
                             }
+                            close_client();
                             return;
                         }
                     },
@@ -463,10 +535,12 @@ impl ClientPipeline {
                 },
             };
             if let Some(frame) = frame {
+                last_in = glib::monotonic_time();
                 if let Err(e) =
                     send_to_sources(frame, &vid_src, &aud_src, &mut state, Instant::now())
                 {
                     log::warn!("{name}::{stream}: Could not stream to a client: {e:#}");
+                    close_client();
                     return;
                 }
             }
@@ -479,6 +553,22 @@ impl ClientPipeline {
             } else if gone_since.get_or_insert_with(Instant::now).elapsed() >= GONE_GRACE {
                 log::debug!("{name}::{stream}: A client left");
                 return;
+            }
+            if let Some(vid_src) = vid_src.as_ref() {
+                let now = glib::monotonic_time();
+                if vid_src.current_state() == gstreamer::State::Playing {
+                    playing_since.get_or_insert(now);
+                } else {
+                    playing_since = None;
+                }
+                let last_out = egress.load(Ordering::Relaxed);
+                if egress_stalled(now, playing_since, last_out, last_in) {
+                    log::warn!(
+                        "{name}::{stream}: A client's video stopped moving, disconnecting it so that it can start again"
+                    );
+                    close_client();
+                    return;
+                }
             }
         }
     }
@@ -1555,10 +1645,21 @@ mod tests {
             element: pipeline.clone().upcast(),
             vid_src: Some(src),
             aud_src: None,
+            egress: Arc::new(AtomicI64::new(0)),
             buffered: vec![],
             media_rx,
         };
         (client, media_tx)
+    }
+
+    /// Counts the clients it disconnects
+    fn counting_close() -> (CloseClient, Arc<std::sync::atomic::AtomicUsize>) {
+        let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = closed.clone();
+        let close: CloseClient = Arc::new(move |_: &Element| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        (close, closed)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1566,7 +1667,8 @@ mod tests {
         let (pipeline, src) = appsrc_pipeline(1024 * 1024);
         pipeline.set_state(gstreamer::State::Playing).unwrap();
         let (client, media_tx) = client(&pipeline, src);
-        let pump = tokio::spawn(client.pump("cam".to_string(), StreamKind::Main));
+        let (close, closed) = counting_close();
+        let pump = tokio::spawn(client.pump("cam".to_string(), StreamKind::Main, close));
         tokio::time::sleep(GONE_GRACE * 3).await;
         assert!(!pump.is_finished(), "the client is still there");
 
@@ -1578,6 +1680,7 @@ mod tests {
             .expect("the pump stops once its client is gone")
             .unwrap();
         assert!(media_tx.is_closed(), "and lets go of the camera stream");
+        assert_eq!(closed.load(Ordering::SeqCst), 0, "nothing left to close");
     }
 
     #[tokio::test]
@@ -1585,7 +1688,8 @@ mod tests {
         let (pipeline, src) = appsrc_pipeline(1024 * 1024);
         pipeline.set_state(gstreamer::State::Playing).unwrap();
         let (client, media_tx) = client(&pipeline, src.clone());
-        let pump = tokio::spawn(client.pump("cam".to_string(), StreamKind::Main));
+        let (close, closed) = counting_close();
+        let pump = tokio::spawn(client.pump("cam".to_string(), StreamKind::Main, close));
 
         drop(media_tx);
         tokio::time::timeout(Duration::from_secs(5), pump)
@@ -1599,6 +1703,42 @@ mod tests {
             Err(FlowError::Eos),
             "the client got an end of stream"
         );
+        assert_eq!(closed.load(Ordering::SeqCst), 1, "and was disconnected");
+    }
+
+    #[test]
+    fn a_playing_client_that_holds_back_its_video_is_stalled() {
+        let s = |seconds: i64| seconds * 1_000_000;
+        // Playing for 30s, frames coming, nothing out for 25s
+        assert!(egress_stalled(s(100), Some(s(70)), s(75), s(99)));
+        // Not playing, or only just
+        assert!(!egress_stalled(s(100), None, 0, s(99)));
+        assert!(!egress_stalled(s(100), Some(s(90)), 0, s(99)));
+        // Video left recently
+        assert!(!egress_stalled(s(100), Some(s(70)), s(95), s(99)));
+        // No frames came to send: nothing to hold back
+        assert!(!egress_stalled(s(100), Some(s(70)), s(75), s(80)));
+    }
+
+    #[test]
+    fn video_leaving_the_pipeline_is_seen() {
+        gstreamer::init().unwrap();
+        let pipeline = gstreamer::Pipeline::new();
+        let bin = gstreamer::parse::bin_from_description(
+            "videotestsrc num-buffers=3 ! jpegenc ! rtpjpegpay name=pay0 ! fakesink",
+            false,
+        )
+        .unwrap();
+        pipeline.add(&bin).unwrap();
+        let egress = Arc::new(AtomicI64::new(0));
+        watch_egress(bin.upcast_ref(), &egress);
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let _ = pipeline.bus().unwrap().timed_pop_filtered(
+            ClockTime::from_seconds(10),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        );
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        assert!(egress.load(Ordering::SeqCst) > 0);
     }
 
     #[test]

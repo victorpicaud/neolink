@@ -43,15 +43,23 @@ jobs:
           sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
       - if: runner.os == 'Windows'
         name: Install Windows deps
+        timeout-minutes: 45
         run: |
+          # Windows PowerShell's progress bar slows Invoke-WebRequest down
+          # dramatically on large downloads like these
+          $ProgressPreference = 'SilentlyContinue'
           # Gstreamer, from its own site. The chocolatey package pinned an
           # installer the site no longer has: it only keeps the last release of
           # older series, so this pins the last 1.24 one.
           $gst = "1.24.13"
           foreach ($msi in @("gstreamer-1.0-msvc-x86_64-$gst.msi", "gstreamer-1.0-devel-msvc-x86_64-$gst.msi")) {
-            Invoke-WebRequest -Uri "https://gstreamer.freedesktop.org/data/pkg/windows/$gst/msvc/$msi" -OutFile $msi
-            $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i", $msi, "/qn", "ADDLOCAL=ALL"
-            if ($install.ExitCode -ne 0) { throw "Installing $msi failed with $($install.ExitCode)" }
+            $path = Join-Path $PWD $msi
+            Invoke-WebRequest -Uri "https://gstreamer.freedesktop.org/data/pkg/windows/$gst/msvc/$msi" -OutFile $path
+            $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i", "`"$path`"", "/qn", "/norestart", "ADDLOCAL=ALL", "/l*v", "`"$path.log`""
+            if ($install.ExitCode -ne 0) {
+              Get-Content "$path.log" -Tail 40
+              throw "Installing $msi failed with $($install.ExitCode)"
+            }
           }
           $env:GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:SYSTEMDRIVE + '\gstreamer\1.0\msvc_x86_64\'
           # Github runners work on both C or D drive and figuring out which was used is difficult

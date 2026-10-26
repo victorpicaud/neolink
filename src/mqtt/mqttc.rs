@@ -6,8 +6,8 @@ use anyhow::{anyhow, Context, Result};
 use futures::future::FutureExt;
 use log::*;
 use rumqttc::{
-    AsyncClient, ConnectReturnCode, Event, Incoming, LastWill, MqttOptions, QoS, TlsConfiguration,
-    Transport,
+    AsyncClient, ConnectReturnCode, Event, EventLoop, Incoming, LastWill, MqttOptions, QoS,
+    TlsConfiguration, Transport,
 };
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -564,35 +564,73 @@ impl LastWillMqtt {
         // On unclean disconnect send this
         mqttoptions.set_last_will(LastWill::new(topic, message, QoS::AtLeastOnce, true));
 
-        let (client, mut connection) = AsyncClient::new(mqttoptions, 100);
-        let client = Arc::new(client);
+        let (client, connection) = AsyncClient::new(mqttoptions, 100);
         let cancel = CancellationToken::new();
         let thread_cancel = cancel.clone();
 
         tokio::task::spawn(async move {
-            loop {
-                let r = tokio::select! {
-                    _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-                    v = connection.poll() =>  {
-                        v?;
-                        AnyResult::Ok(())
-                    },
-                };
-                if r.is_ok() {
-                    continue;
-                }
-                break r;
-            }?;
+            let r = poll_last_will(connection, thread_cancel).await;
             drop(client);
-            AnyResult::Ok(())
+            r
         });
 
         Ok(LastWillMqtt { cancel })
     }
 }
 
+/// Keep the last-will connection alive until `cancel` fires or the
+/// connection fails.
+///
+/// Cancellation must end the loop: `cancelled()` stays ready once the token
+/// is cancelled, so treating it as just another iteration spins forever
+/// without yielding and pins a runtime worker.
+async fn poll_last_will(mut connection: EventLoop, cancel: CancellationToken) -> AnyResult<()> {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break Ok(()),
+            v = connection.poll() => {
+                v?;
+            }
+        }
+    }
+}
+
 impl Drop for LastWillMqtt {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cancelling a last-will connection used to leave its task spinning at
+    /// 100% CPU, so the loop never finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn last_will_loop_stops_on_cancel() {
+        // A "broker" that accepts the TCP connection and never answers, so
+        // `poll()` stays pending and only cancellation can end the loop.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let (_client, connection) =
+            AsyncClient::new(MqttOptions::new("neolink-test", "127.0.0.1", port), 10);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(poll_last_will(connection, cancel.clone()));
+        sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+
+        // Cancellation alone must end the task, promptly and cleanly.
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("last-will loop kept running after cancel");
+        assert!(result.unwrap().is_ok());
     }
 }

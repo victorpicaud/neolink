@@ -87,16 +87,15 @@ impl BcConnection {
 
         let thread_cancel = cancel.clone();
         rx_thread.spawn(async move {
+            // `run` only returns once polling is over: on an error, or with
+            // `Ok` once every command sender is gone. Calling it again after
+            // `Ok` would return immediately, every time, pinning a core.
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
-                v = async {
-                    loop {
-                        if let n @ Err(_) = poller.run().await {
-                            trace!("Polling has ended");
-                            return n;
-                        }
-                    }
-                }=> v
+                v = poller.run() => {
+                    trace!("Polling has ended");
+                    v
+                }
             }
         });
 
@@ -401,5 +400,30 @@ impl Poller {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// `Poller::run` returns `Ok` as soon as its command channel is closed.
+    /// The task driving it must therefore not call it again in a loop, or it
+    /// spins without ever yielding.
+    #[tokio::test]
+    async fn poller_run_returns_once_commands_close() {
+        let (sink, _sink_rx) = channel::<Result<Bc>>(1);
+        let (commander, commanded) = channel::<PollCommand>(1);
+        let mut poller = Poller {
+            subscribers: Default::default(),
+            sink,
+            reciever: ReceiverStream::new(commanded),
+        };
+        drop(commander);
+        let result = tokio::time::timeout(Duration::from_secs(1), poller.run())
+            .await
+            .expect("Poller::run did not return after its commands closed");
+        assert!(result.is_ok());
     }
 }

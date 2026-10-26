@@ -71,22 +71,25 @@ jobs:
           # Proto buffers
           choco install -y --no-progress protoc --version=24.2.0
 
-          # Open SSL, for the push notification client. 1.1 is end of life.
-          choco install -y --no-progress openssl
-          $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL-Win64\'
-
-          # Alternative openssl location (depends on version that gets installed by choco)
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL\'
+          # Open SSL, for the push notification client. The runner images come
+          # with it: installing it again meant a download from a site that
+          # stalled for the whole step timeout. Where it is depends on the
+          # installer and on which drive the runner uses.
+          $openssl = @(
+            "$env:SYSTEMDRIVE\Program Files\OpenSSL-Win64\",
+            "$env:SYSTEMDRIVE\Program Files\OpenSSL\",
+            'D:\Program Files\OpenSSL-Win64\',
+            'D:\Program Files\OpenSSL\'
+          )
+          $env:OPENSSL_DIR = $openssl | Where-Object { Test-Path (Join-Path $_ 'include\openssl\ssl.h') } | Select-Object -First 1
+          if (-not $env:OPENSSL_DIR) {
+            choco install -y --no-progress --execution-timeout=900 openssl
+            $env:OPENSSL_DIR = $openssl | Where-Object { Test-Path (Join-Path $_ 'include\openssl\ssl.h') } | Select-Object -First 1
           }
-          # Github runners work on both C or D drive and figuring out which was used is difficult
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR='D:\\Program Files\OpenSSL-Win64\'
+          if (-not $env:OPENSSL_DIR) {
+            throw "No OpenSSL with headers in any of $openssl"
           }
-          # Or course we could be on alternative location and drive....
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR='D:\\Program Files\OpenSSL\'
-          }
+          echo "OPENSSL_DIR=$env:OPENSSL_DIR"
 
           # Set github vars
           Add-Content -Path $env:GITHUB_ENV  -Value "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"

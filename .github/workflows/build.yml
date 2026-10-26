@@ -44,9 +44,15 @@ jobs:
       - if: runner.os == 'Windows'
         name: Install Windows deps
         run: |
-          # Gstreamer
-          choco install -y --no-progress gstreamer --version=1.24.2
-          choco install -y --no-progress gstreamer-devel --version=1.24.2
+          # Gstreamer, from its own site. The chocolatey package pinned an
+          # installer the site no longer has: it only keeps the last release of
+          # older series, so this pins the last 1.24 one.
+          $gst = "1.24.13"
+          foreach ($msi in @("gstreamer-1.0-msvc-x86_64-$gst.msi", "gstreamer-1.0-devel-msvc-x86_64-$gst.msi")) {
+            Invoke-WebRequest -Uri "https://gstreamer.freedesktop.org/data/pkg/windows/$gst/msvc/$msi" -OutFile $msi
+            $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i", $msi, "/qn", "ADDLOCAL=ALL"
+            if ($install.ExitCode -ne 0) { throw "Installing $msi failed with $($install.ExitCode)" }
+          }
           $env:GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:SYSTEMDRIVE + '\gstreamer\1.0\msvc_x86_64\'
           # Github runners work on both C or D drive and figuring out which was used is difficult
           if (-not (Test-Path -Path "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64" -PathType Container)) {
@@ -57,8 +63,8 @@ jobs:
           # Proto buffers
           choco install -y --no-progress protoc --version=24.2.0
 
-          # Open SSL
-          choco install -y --no-progress openssl --version=1.1.1.2100
+          # Open SSL, for the push notification client. 1.1 is end of life.
+          choco install -y --no-progress openssl
           $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL-Win64\'
 
           # Alternative openssl location (depends on version that gets installed by choco)
@@ -86,8 +92,13 @@ jobs:
       - if: runner.os == 'macOS'
         name: Install macOS deps
         run: |
-          curl -L 'https://gstreamer.freedesktop.org/data/pkg/osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg' -o "$(pwd)/gstreamer-devel.pkg"
-          sudo installer -verbose -pkg "$(pwd)/gstreamer-devel.pkg" -target /
+          # The site only keeps the last release of older series, so this pins
+          # the last 1.24 one. The libraries are in the runtime package.
+          gst=1.24.13
+          for pkg in "gstreamer-1.0-$gst-universal.pkg" "gstreamer-1.0-devel-$gst-universal.pkg"; do
+            curl -fsSL "https://gstreamer.freedesktop.org/data/pkg/osx/$gst/$pkg" -o "$(pwd)/$pkg"
+            sudo installer -pkg "$(pwd)/$pkg" -target /
+          done
           PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           PKG_CONFIG_GSTREAMER_1_0_PREFIX="/Library/Frameworks/GStreamer.framework/Versions/1.0"
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}" >> "${GITHUB_ENV}"

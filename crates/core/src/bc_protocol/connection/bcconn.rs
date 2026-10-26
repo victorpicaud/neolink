@@ -730,6 +730,25 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_that_never_comes_fails_its_request() {
+        let (connection, _camera, _written) = connection(10).await;
+        let mut reply = connection.subscribe(MSG_ID_VERSION, 1).await.unwrap();
+        assert!(matches!(reply.recv().await, Err(Error::Timeout(_))));
+
+        // Events come whenever they like
+        let mut events = connection
+            .subscribe_events(MSG_ID_MOTION, 10)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(600), events.recv_untimed())
+                .await
+                .is_err(),
+            "an event subscription must not time out"
+        );
+    }
+
     #[tokio::test]
     async fn an_event_subscription_sees_every_message_number() {
         let (connection, camera, _written) = connection(10).await;

@@ -20,8 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance, Permit,
-    UseCounter,
+    Backoff, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance,
+    Permit, UseCounter,
 };
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
@@ -239,12 +239,33 @@ impl NeoCam {
                     AnyResult::Ok(())
                 },
                 v = async {
-                    let uid = uid_instance.run_task(|cam| Box::pin(async move {
-                        let uid = cam.uid().await?;
-                        Ok(uid)
-                    })).await?;
-                    uid_tx.send_replace(Some(uid));
-                    AnyResult::Ok(())
+                    // One failure used to end this for good, and every
+                    // request for the UID then waited forever
+                    let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(300));
+                    let mut uid = uid_instance.run_task(|cam| Box::pin(async move {
+                        Ok(cam.uid().await?)
+                    })).await;
+                    loop {
+                        match uid {
+                            Ok(uid) => {
+                                uid_tx.send_replace(Some(uid));
+                                break AnyResult::Ok(());
+                            }
+                            Err(e) if matches!(e.downcast_ref::<neolink_core::Error>(), Some(neolink_core::Error::CameraServiceUnavailable { .. })) => {
+                                log::debug!("The camera does not tell its UID: {e:#}");
+                                break AnyResult::Ok(());
+                            }
+                            Err(e) => {
+                                let delay = backoff.next_delay();
+                                log::debug!("Could not get the camera's UID, retrying in {delay:.1?}: {e:#}");
+                                sleep(delay).await;
+                            }
+                        }
+                        // Without keeping a battery camera awake for it
+                        uid = uid_instance.run_passive_task(|cam| Box::pin(async move {
+                            Ok(cam.uid().await?)
+                        })).await;
+                    }
                 } => v,
             }
         });

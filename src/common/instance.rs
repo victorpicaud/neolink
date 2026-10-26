@@ -125,21 +125,31 @@ impl NeoInstance {
                     if let Some(cam) = camera.clone() {
                         let cam_ref = cam.as_ref();
                         let mut r = Err(anyhow!("No run"));
+                        let mut timeouts = 0;
                         for i in 0..5 {
                             r = task(cam_ref).await;
                             if let Err(e) = &r {
                                 log::debug!("- Task Error: {e:?}");
                             }
-                            if let Err(Some(e @ neolink_core::Error::CameraServiceUnavailable{code: 400, ..})) = r.as_ref().map_err(|e| e.downcast_ref::<neolink_core::Error>()) {
-                                // Retryable without a reconnect
-                                // Usually occurs when camera is starting up
-                                // or the connection is initialising
-                                log::debug!("Got a 400 code for {e:?} retry {i}/5, ");
+                            match r.as_ref().map_err(|e| e.downcast_ref::<neolink_core::Error>()) {
+                                Err(Some(e @ neolink_core::Error::CameraServiceUnavailable{code: 400, ..})) => {
+                                    // Retryable without a reconnect
+                                    // Usually occurs when camera is starting up
+                                    // or the connection is initialising
+                                    log::debug!("Got a 400 code for {e:?} retry {i}/5, ");
 
-                                sleep(Duration::from_secs(1)).await;
-                                continue;
-                            } else {
-                                break;
+                                    sleep(Duration::from_secs(1)).await;
+                                    continue;
+                                }
+                                // The reply did not come in time. Tried again,
+                                // once, on this connection: waiting for a new
+                                // one, as for a dropped connection, would wait
+                                // forever if this one is fine.
+                                Err(Some(neolink_core::Error::Timeout(_))) if timeouts < 1 => {
+                                    timeouts += 1;
+                                    continue;
+                                }
+                                _ => break,
                             }
                         }
                         r

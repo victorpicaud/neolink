@@ -6,9 +6,14 @@ use std::io::{Error as IoError, Result as IoResult};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
+use tokio::time::{timeout, Duration};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::codec::FramedRead;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+/// How long a reply may take. A request used to wait for its reply forever,
+/// and whatever made it waited with it.
+const RECV_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct BcSubscription<'a> {
     rx: ReceiverStream<Result<Bc>>,
@@ -71,7 +76,14 @@ impl<'a> BcSubscription<'a> {
         Ok(())
     }
 
+    /// The next reply, failing with [`Error::Timeout`] if none comes in 15s
     pub async fn recv(&mut self) -> Result<Bc> {
+        timeout(RECV_TIMEOUT, self.recv_untimed()).await?
+    }
+
+    /// The next message, however long it takes: for messages the camera
+    /// sends whenever it likes, like motion alarms
+    pub async fn recv_untimed(&mut self) -> Result<Bc> {
         let bc = self.rx.next().await.ok_or(Error::DroppedSubscriber)?;
         if self.events {
             return bc;

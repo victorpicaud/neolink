@@ -8,6 +8,7 @@ use crate::bc_protocol::{md5_string, Md5Trunc, TcpSource};
 use crate::bcudp::codex::BcUdpCodex;
 use crate::bcudp::model::*;
 use crate::bcudp::xml::*;
+use crate::Credentials;
 use crate::{Error, Result};
 use futures::{
     sink::SinkExt,
@@ -1070,10 +1071,17 @@ impl Discovery {
 
     // Check if TCP is possible
     //
-    // To do this we send a dummy login  and see if it replies with any BC packet
-    pub(crate) async fn check_tcp(&self, addr: SocketAddr, channel_id: u8) -> Result<()> {
-        let username = "admin";
-        let password = Some("123456");
+    // To do this we send a login and see if it replies with any BC packet.
+    // With the configured credentials: a login with the factory ones failed on
+    // every connection attempt, which a camera can count against us.
+    pub(crate) async fn check_tcp(
+        &self,
+        addr: SocketAddr,
+        channel_id: u8,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        let username = credentials.username.as_str();
+        let password = credentials.password.as_deref();
         let mut tcp_source =
             timeout(TCP_WAIT, TcpSource::new(addr, username, password, false)).await??;
 
@@ -1258,9 +1266,22 @@ fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
         .collect())
 }
 
+/// A transaction id that no other discovery message in flight has: replies
+/// are matched to their requests by it. A random u8 clashed one time in 256
+/// for every two discoveries running at once.
 fn generate_tid() -> u32 {
-    let mut rng = thread_rng();
-    (rng.gen::<u8>()) as u32
+    static NEXT_TID: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+    let next = NEXT_TID.get_or_init(|| {
+        // Starts small, like the random ones did
+        std::sync::atomic::AtomicU32::new(thread_rng().gen::<u8>() as u32 + 1)
+    });
+    loop {
+        let tid = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 0 means "any transaction" to the subscribers
+        if tid != 0 {
+            return tid;
+        }
+    }
 }
 
 fn generate_cid() -> i32 {
@@ -1556,3 +1577,16 @@ async fn connect() -> Result<UdpSocket> {
     ```
 
 */
+
+#[cfg(test)]
+mod tid_tests {
+    use super::generate_tid;
+    use std::collections::HashSet;
+
+    #[test]
+    fn transaction_ids_are_unique_and_never_zero() {
+        let tids: HashSet<u32> = (0..10_000).map(|_| generate_tid()).collect();
+        assert_eq!(tids.len(), 10_000);
+        assert!(!tids.contains(&0));
+    }
+}

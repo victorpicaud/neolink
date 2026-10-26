@@ -567,6 +567,7 @@ dependencies = [
  "rand",
  "regex",
  "serde",
+ "socket2",
  "thiserror 1.0.69",
  "time",
  "tokio",

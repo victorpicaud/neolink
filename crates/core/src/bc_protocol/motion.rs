@@ -281,7 +281,7 @@ impl BcCamera {
                     loop {
                         let ended = matches!(pending, Some(Err(_)));
                         tokio::select! {
-                            msg = sub.recv(), if !ended => {
+                            msg = sub.recv_untimed(), if !ended => {
                                 let status = msg.map(|msg| motion_status(msg, channel_id));
                                 pending = Some(supersede(pending.take(), status));
                             }

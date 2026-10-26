@@ -10,6 +10,7 @@
 #   FAKECAM_TARGET_DIR  where fakecam builds (default $CARGO_TARGET_DIR/fakecam)
 #   NEOLINK_BIN         test this neolink binary instead of building one, e.g.
 #                       to compare against another branch
+#   KEEP_LOGS           a directory to copy the logs to on exit
 #
 # Logs go to $WORK, which is removed on exit along with every process started
 # here.
@@ -31,6 +32,10 @@ PIDS=()
 cleanup() {
   kill "${PIDS[@]}" 2>/dev/null || true
   wait 2>/dev/null || true
+  if [ -n "${KEEP_LOGS:-}" ]; then
+    mkdir -p "$KEEP_LOGS"
+    cp "$WORK"/*.log "$KEEP_LOGS"/ 2>/dev/null || true
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -112,4 +117,20 @@ fail() {
     tail -n 60 "$log"
   done
   exit 1
+}
+
+FAILURES=0
+# flunk MESSAGE: records a failed check and carries on, so that one run shows
+# everything that is broken
+flunk() {
+  echo "FAIL: $*"
+  FAILURES=$((FAILURES + 1))
+}
+
+# finish: passes, or fails with the logs if any check flunked
+finish() {
+  if [ "$FAILURES" -gt 0 ]; then
+    fail "$FAILURES check(s) failed"
+  fi
+  echo "PASS"
 }

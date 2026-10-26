@@ -10,7 +10,7 @@ use anyhow::Context;
 use gstreamer::glib::{self, object_subclass, MainLoop, Object};
 use gstreamer_rtsp::RTSPAuthMethod;
 use gstreamer_rtsp_server::{
-    gio::{TlsAuthenticationMode, TlsCertificate},
+    gio::{Cancellable, TlsAuthenticationMode, TlsCertificate},
     prelude::*,
     subclass::prelude::*,
     RTSPAuth, RTSPFilterResult, RTSPServer, RTSPToken, RTSP_TOKEN_MEDIA_FACTORY_ROLE,
@@ -27,6 +27,11 @@ use tokio::{
     time::{timeout, Duration},
 };
 use tokio_util::sync::CancellationToken;
+
+/// GStreamer serves every RTSP client from one shared thread by default, so a
+/// client waiting on a slow camera held up all the others. Clients now get a
+/// thread each, up to this many; beyond that they share threads again.
+const MAX_CLIENT_THREADS: i32 = 64;
 
 glib::wrapper! {
     /// The wrapped RTSPServer
@@ -57,6 +62,11 @@ impl NeoRtspServer {
         auth.set_default_token(Some(&mut un_authtoken));
         factory.set_auth(Some(&auth));
 
+        if let Some(pool) = factory.thread_pool() {
+            pool.set_max_threads(MAX_CLIENT_THREADS);
+            log::debug!("RTSP clients get up to {} threads", pool.max_threads());
+        }
+
         factory.connect_client_connected(|_, client| {
             client.connect_new_session(|_, session| {
                 log::debug!("New Session");
@@ -76,8 +86,13 @@ impl NeoRtspServer {
         let server = self;
         server.set_address(bind_addr);
         server.set_service(&format!("{}", bind_port));
-        // Attach server to default Glib context
-        let _ = server.attach(None);
+        // Attach server to default Glib context. Binding happens here, so an
+        // address or port that cannot be used fails startup instead of leaving
+        // a server that never answers.
+        server
+            .create_source(None::<&Cancellable>)
+            .with_context(|| format!("Could not listen for RTSP on {bind_addr}:{bind_port}"))?
+            .attach(None);
         let main_loop = Arc::new(MainLoop::new(None, false));
 
         // Run the Glib main loop.
@@ -256,5 +271,30 @@ impl NeoRtspServerImpl {
     pub(crate) async fn get_users(&self) -> AnyResult<HashSet<String>> {
         let locked_users = self.users.read().await;
         Ok(locked_users.keys().cloned().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_port_in_use_fails_startup() -> AnyResult<()> {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = taken.local_addr()?.port();
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        let started =
+            runtime.block_on(async { NeoRtspServer::new()?.run("127.0.0.1", port).await });
+        // A server that did start runs its main loop on a blocking thread,
+        // which would hold up the runtime's shutdown forever
+        runtime.shutdown_background();
+
+        let error = started.expect_err("the port is already taken");
+        assert!(
+            format!("{error:#}").contains("Could not listen for RTSP"),
+            "{error:#}"
+        );
+        Ok(())
     }
 }

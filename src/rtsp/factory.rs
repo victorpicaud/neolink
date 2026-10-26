@@ -1,4 +1,8 @@
 use gstreamer::ClockTime;
+use std::sync::{
+    mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender},
+    Arc, Mutex, PoisonError,
+};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -10,7 +14,11 @@ use neolink_core::{
         BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
     },
 };
-use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
+use tokio::{
+    sync::mpsc::{channel as mpsc, error::TrySendError, Receiver as MpscReceiver},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 
@@ -144,170 +152,292 @@ impl StreamConfig {
     }
 }
 
-pub(super) async fn make_dummy_factory(
-    use_splash: bool,
-    pattern: String,
-) -> AnyResult<NeoMediaFactory> {
-    NeoMediaFactory::new_with_callback(move |element| {
-        clear_bin(&element)?;
-        if !use_splash {
-            Ok(None)
+pub(super) fn make_dummy_factory(use_splash: bool, pattern: String) -> NeoMediaFactory {
+    NeoMediaFactory::new_with_callback(move || {
+        if use_splash {
+            splash(&pattern)
         } else {
-            build_unknown(&element, &pattern)?;
-            Ok(Some(element))
+            Err(anyhow!("The camera is not ready yet"))
         }
     })
-    .await
 }
 
-enum ClientMsg {
-    NewClient {
-        element: Element,
-        reply: tokio::sync::oneshot::Sender<Element>,
-    },
-}
+/// How long a new client waits for its pipeline. The wait holds a GStreamer
+/// thread, and the factory lock that every other new client of the stream
+/// needs, so it has to end even when the camera never sends video.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
-    let (client_tx, mut client_rx) = mpsc(100);
+    let config = camera.config().await?;
+    let name = config.borrow().name.clone();
+    let (client_tx, mut client_rx) = mpsc::<ClientRequest>(100);
     // Create the task that creates the pipelines
-    let thread = tokio::task::spawn(async move {
-        let name = camera.config().await?.borrow().name.clone();
-
-        while let Some(msg) = client_rx.recv().await {
-            match msg {
-                ClientMsg::NewClient { element, reply } => {
-                    log::debug!("New client for {name}::{stream}");
-                    let camera = camera.clone();
-                    let name = name.clone();
-                    tokio::task::spawn(async move {
-                        clear_bin(&element)?;
-                        log::trace!("{name}::{stream}: Starting camera");
-
-                        // Start the camera
-                        let config = camera.config().await?.borrow().clone();
-                        let mut media_rx = camera.stream_while_live(stream).await?;
-
-                        log::trace!("{name}::{stream}: Learning camera stream type");
-                        // Learn the camera data type
-                        let mut buffer = vec![];
-                        let mut frame_count = 0usize;
-
-                        let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if frame_count > 10
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-                            {
-                                break;
-                            }
-                            frame_count += 1;
-                        }
-
-                        log::trace!("{name}::{stream}: Building the pipeline");
-                        // Build the right video pipeline
-                        let vid_src = match stream_config.vid_type.as_ref() {
-                            Some(VideoType::H264) => {
-                                let src = build_h264(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            Some(VideoType::H265) => {
-                                let src = build_h265(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            None => {
-                                build_unknown(&element, &config.splash_pattern.to_string())?;
-                                AnyResult::Ok(None)
-                            }
-                        }?;
-
-                        // Build the right audio pipeline
-                        let aud_src = match stream_config.aud_type.as_ref() {
-                            Some(AudioType::Aac) => {
-                                let src = build_aac(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            Some(AudioType::Adpcm(block_size)) => {
-                                let src = build_adpcm(&element, *block_size, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            None => AnyResult::Ok(None),
-                        }?;
-
-                        if let Some(app) = vid_src.as_ref() {
-                            app.set_callbacks(
-                                AppSrcCallbacks::builder()
-                                    .seek_data(move |_, _seek_pos| true)
-                                    .build(),
-                            );
-                        }
-                        if let Some(app) = aud_src.as_ref() {
-                            app.set_callbacks(
-                                AppSrcCallbacks::builder()
-                                    .seek_data(move |_, _seek_pos| true)
-                                    .build(),
-                            );
-                        }
-
-                        log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
-                        // Send the pipeline back to the factory so it can start
-                        let _ = reply.send(element);
-
-                        // Run blocking code on a seperate thread
-                        // This is not an async thread
-                        std::thread::spawn(move || {
-                            let mut state = PumpState::default();
-
-                            log::trace!("{name}::{stream}: Sending buffered frames");
-                            for buffered in buffer.drain(..) {
-                                send_to_sources(
-                                    buffered,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut state,
-                                    &stream_config,
-                                )?;
-                            }
-
-                            log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut state,
-                                    &stream_config,
-                                );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
-                                }
-                                r?;
-                            }
-                            log::trace!("All media recieved");
-                            AnyResult::Ok(())
-                        });
-                        AnyResult::Ok(())
-                    });
-                }
+    let thread = tokio::task::spawn({
+        let name = name.clone();
+        async move {
+            while let Some(request) = client_rx.recv().await {
+                log::debug!("New client for {name}::{stream}");
+                tokio::task::spawn(serve_client(camera.clone(), name.clone(), stream, request));
             }
+            AnyResult::Ok(())
         }
-        AnyResult::Ok(())
     });
 
-    // Now setup the factory
-    let factory = NeoMediaFactory::new_with_callback(move |element| {
-        let (reply, new_element) = tokio::sync::oneshot::channel();
-        client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
-
-        let element = new_element.blocking_recv()?;
-        Ok(Some(element))
-    })
-    .await?;
+    // Now setup the factory. GStreamer calls this on one of its threads.
+    let factory = NeoMediaFactory::new_with_callback(move || {
+        let (request, reply) = client_request();
+        let built = match client_tx.try_send(request) {
+            Ok(()) => reply.wait(BUILD_TIMEOUT),
+            Err(TrySendError::Full(_)) => Err(anyhow!("Too many clients are waiting")),
+            Err(TrySendError::Closed(_)) => Err(anyhow!("The stream has stopped")),
+        };
+        built.or_else(|e| {
+            let (use_splash, pattern) = {
+                let config = config.borrow();
+                (config.use_splash, config.splash_pattern.to_string())
+            };
+            if use_splash {
+                log::warn!("{name}::{stream}: {e:#}, sending the splash screen");
+                splash(&pattern)
+            } else {
+                Err(e)
+            }
+        })
+    });
     Ok((factory, thread))
+}
+
+/// What both ends of a client's request share
+struct RequestState {
+    /// Taken by whichever end gets to it first: the builder to deliver the
+    /// pipeline, or the waiter to give up on it. A pipeline is therefore
+    /// either served and streamed into, or dropped, never both.
+    reply: Mutex<Option<SyncSender<AnyResult<Element>>>>,
+    /// Cancelled when the waiter gives up, to stop the builder
+    abandoned: CancellationToken,
+}
+
+impl RequestState {
+    fn take_reply(&self) -> Option<SyncSender<AnyResult<Element>>> {
+        self.reply
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// A new client's request for a pipeline, handled by the factory's task
+struct ClientRequest(Arc<RequestState>);
+
+/// The end of a [`ClientRequest`] where GStreamer waits for the pipeline
+struct ClientReply {
+    state: Arc<RequestState>,
+    built: Receiver<AnyResult<Element>>,
+}
+
+fn client_request() -> (ClientRequest, ClientReply) {
+    let (reply, built) = sync_channel(1);
+    let state = Arc::new(RequestState {
+        reply: Mutex::new(Some(reply)),
+        abandoned: CancellationToken::new(),
+    });
+    (ClientRequest(state.clone()), ClientReply { state, built })
+}
+
+impl ClientRequest {
+    /// Resolves once the client has stopped waiting
+    async fn abandoned(&self) {
+        self.0.abandoned.cancelled().await
+    }
+
+    /// Answers the client. Returns false if it stopped waiting first: the
+    /// pipeline must then be dropped without streaming into it.
+    fn deliver(self, built: AnyResult<Element>) -> bool {
+        match self.0.take_reply() {
+            Some(reply) => {
+                // The only message on a channel with room for one
+                let _ = reply.try_send(built);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl Drop for ClientRequest {
+    fn drop(&mut self) {
+        // Dropped unanswered, e.g. its task panicked: release the client now
+        // rather than at the deadline
+        self.0.take_reply();
+    }
+}
+
+impl ClientReply {
+    /// Waits up to `timeout` for the pipeline, then gives up on it
+    fn wait(self, timeout: Duration) -> AnyResult<Element> {
+        match self.built.recv_timeout(timeout) {
+            Ok(built) => built,
+            Err(RecvTimeoutError::Timeout) if self.state.take_reply().is_some() => {
+                self.state.abandoned.cancel();
+                Err(anyhow!(
+                    "The camera sent no video within {}s",
+                    timeout.as_secs()
+                ))
+            }
+            // The builder claimed the request just in time: its answer is on
+            // the way
+            Err(RecvTimeoutError::Timeout) => self
+                .built
+                .recv()
+                .unwrap_or_else(|_| Err(anyhow!("The pipeline could not be built"))),
+            Err(RecvTimeoutError::Disconnected) => Err(anyhow!("The pipeline could not be built")),
+        }
+    }
+}
+
+/// Starts the camera stream for one client and builds its pipeline. Frames
+/// only flow if the client is still waiting; otherwise everything is dropped,
+/// which stops the camera stream again.
+async fn serve_client(
+    camera: NeoInstance,
+    name: String,
+    stream: StreamKind,
+    request: ClientRequest,
+) {
+    let built = tokio::select! {
+        _ = request.abandoned() => {
+            log::debug!("{name}::{stream}: The client stopped waiting");
+            return;
+        }
+        built = prepare_client(&camera, &name, stream) => built,
+    };
+    match built {
+        Ok(client) => {
+            log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
+            if request.deliver(Ok(client.element.clone())) {
+                client.start_pump(name, stream);
+            }
+        }
+        Err(e) => {
+            request.deliver(Err(e));
+        }
+    }
+}
+
+/// A client's pipeline, ready for frames
+struct ClientPipeline {
+    element: Element,
+    vid_src: Option<AppSrc>,
+    aud_src: Option<AppSrc>,
+    stream_config: StreamConfig,
+    /// The frames received while learning the stream type
+    buffered: Vec<BcMedia>,
+    media_rx: MpscReceiver<BcMedia>,
+}
+
+async fn prepare_client(
+    camera: &NeoInstance,
+    name: &str,
+    stream: StreamKind,
+) -> AnyResult<ClientPipeline> {
+    log::trace!("{name}::{stream}: Starting camera");
+
+    // Start the camera
+    let config = camera.config().await?.borrow().clone();
+    let mut media_rx = camera.stream_while_live(stream).await?;
+
+    log::trace!("{name}::{stream}: Learning camera stream type");
+    // Learn the camera data type
+    let mut buffered = vec![];
+    let mut frame_count = 0usize;
+
+    let mut stream_config = StreamConfig::new(camera, stream).await?;
+    while let Some(media) = media_rx.recv().await {
+        stream_config.update_from_media(&media);
+        buffered.push(media);
+        if frame_count > 10
+            || (stream_config.vid_type.is_some() && stream_config.aud_type.is_some())
+        {
+            break;
+        }
+        frame_count += 1;
+    }
+
+    log::trace!("{name}::{stream}: Building the pipeline");
+    let element = Bin::new().upcast::<Element>();
+    // Build the right video pipeline
+    let vid_src = match stream_config.vid_type.as_ref() {
+        Some(VideoType::H264) => Some(build_h264(&element, &stream_config)?),
+        Some(VideoType::H265) => Some(build_h265(&element, &stream_config)?),
+        None => {
+            build_unknown(&element, &config.splash_pattern.to_string())?;
+            None
+        }
+    };
+
+    // Build the right audio pipeline
+    let aud_src = match stream_config.aud_type.as_ref() {
+        Some(AudioType::Aac) => Some(build_aac(&element, &stream_config)?),
+        Some(AudioType::Adpcm(block_size)) => {
+            Some(build_adpcm(&element, *block_size, &stream_config)?)
+        }
+        None => None,
+    };
+
+    for app in vid_src.iter().chain(aud_src.iter()) {
+        app.set_callbacks(
+            AppSrcCallbacks::builder()
+                .seek_data(move |_, _seek_pos| true)
+                .build(),
+        );
+    }
+
+    Ok(ClientPipeline {
+        element,
+        vid_src,
+        aud_src,
+        stream_config,
+        buffered,
+        media_rx,
+    })
+}
+
+impl ClientPipeline {
+    /// Sends the camera's frames into the pipeline
+    fn start_pump(self, name: String, stream: StreamKind) {
+        let ClientPipeline {
+            vid_src,
+            aud_src,
+            stream_config,
+            buffered,
+            mut media_rx,
+            ..
+        } = self;
+        // Run blocking code on a seperate thread
+        // This is not an async thread
+        std::thread::spawn(move || {
+            let mut state = PumpState::default();
+
+            log::trace!("{name}::{stream}: Sending buffered frames");
+            for buffered in buffered {
+                send_to_sources(buffered, &vid_src, &aud_src, &mut state, &stream_config)?;
+            }
+
+            log::trace!("{name}::{stream}: Sending new frames");
+            while let Some(data) = media_rx.blocking_recv() {
+                let r = send_to_sources(data, &vid_src, &aud_src, &mut state, &stream_config);
+                if let Err(r) = &r {
+                    log::info!("Failed to send to source: {r:?}");
+                }
+                r?;
+            }
+            log::trace!("All media recieved");
+            AnyResult::Ok(())
+        });
+    }
 }
 
 /// Per-client state of the frame pump
@@ -467,17 +597,11 @@ fn check_live(app: &AppSrc) -> Result<()> {
         .ok_or(anyhow!("App source is not linked"))
 }
 
-fn clear_bin(bin: &Element) -> Result<()> {
-    let bin = bin
-        .clone()
-        .dynamic_cast::<Bin>()
-        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
-    // Clear the autogenerated ones
-    for element in bin.iterate_elements().into_iter().flatten() {
-        bin.remove(&element)?;
-    }
-
-    Ok(())
+/// A new pipeline showing the "Stream not Ready" splash screen
+fn splash(pattern: &str) -> AnyResult<Element> {
+    let element = Bin::new().upcast::<Element>();
+    build_unknown(&element, pattern)?;
+    Ok(element)
 }
 
 fn build_unknown(bin: &Element, pattern: &str) -> Result<()> {
@@ -1196,6 +1320,84 @@ mod tests {
             matches!(message.view(), gstreamer::MessageView::AsyncDone(_)),
             "{message:?}"
         );
+    }
+
+    fn empty_pipeline() -> Element {
+        gstreamer::init().unwrap();
+        gstreamer::Bin::new().upcast()
+    }
+
+    #[test]
+    fn a_pipeline_built_in_time_is_served() {
+        let (request, reply) = client_request();
+        let element = empty_pipeline();
+        let builder = std::thread::spawn(move || request.deliver(Ok(element)));
+
+        assert!(reply.wait(Duration::from_secs(5)).is_ok());
+        assert!(
+            builder.join().unwrap(),
+            "a served pipeline must be streamed into"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_pipeline_is_dropped_and_its_builder_stopped() {
+        let (request, reply) = client_request();
+
+        assert!(reply.wait(Duration::from_millis(10)).is_err());
+        tokio::time::timeout(Duration::from_secs(1), request.abandoned())
+            .await
+            .expect("the builder must be told to stop");
+        assert!(
+            !request.deliver(Ok(empty_pipeline())),
+            "a late pipeline must not be streamed into"
+        );
+    }
+
+    #[test]
+    fn a_failed_builder_releases_the_client_at_once() {
+        let (request, reply) = client_request();
+        drop(request);
+
+        let started = std::time::Instant::now();
+        assert!(reply.wait(Duration::from_secs(10)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_pipeline_delivered_at_the_deadline_is_served_or_dropped_never_both() {
+        for i in 0..100u64 {
+            let (request, reply) = client_request();
+            let element = empty_pipeline();
+            let delay = Duration::from_micros(500 + (i % 10) * 100);
+            let builder = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                request.deliver(Ok(element))
+            });
+
+            let served = reply.wait(Duration::from_millis(1)).is_ok();
+            let streamed = builder.join().unwrap();
+            assert_eq!(served, streamed, "attempt {i}");
+        }
+    }
+
+    #[test]
+    fn a_dummy_factory_serves_the_splash_screen_or_refuses() {
+        use gstreamer_rtsp_server::prelude::*;
+        gstreamer::init().unwrap();
+        let url = gstreamer_rtsp::RTSPUrl::parse("rtsp://127.0.0.1:8554/cam/main")
+            .1
+            .unwrap();
+
+        assert!(make_dummy_factory(false, "snow".to_string())
+            .construct(&url)
+            .is_err());
+        let media = make_dummy_factory(true, "snow".to_string())
+            .construct(&url)
+            .expect("the splash screen");
+        // GStreamer hands it over locked, for the client to configure
+        media.unlock();
+        assert_eq!(media.n_streams(), 1);
     }
 
     #[test]

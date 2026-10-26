@@ -85,6 +85,8 @@ jobs:
         run: cargo test --manifest-path iso-test/sim/fakecam/Cargo.toml
       - name: End-to-end smoke test (neolink rtsp <- fake camera)
         run: bash iso-test/sim/smoke.sh
+      - name: End-to-end stuck camera test
+        run: bash iso-test/sim/stuck-camera.sh
 
   check_deny:
     needs: pre_job

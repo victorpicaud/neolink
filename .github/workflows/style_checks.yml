@@ -87,6 +87,8 @@ jobs:
         run: bash iso-test/sim/smoke.sh
       - name: End-to-end stuck camera test
         run: bash iso-test/sim/stuck-camera.sh
+      - name: End-to-end shared stream test
+        run: bash iso-test/sim/shared-stream.sh
       - name: End-to-end config reload test (over MQTT)
         run: bash iso-test/sim/config-reload.sh
       - name: End-to-end MQTT burst test

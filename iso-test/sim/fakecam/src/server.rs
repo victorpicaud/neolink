@@ -16,6 +16,7 @@ use neolink_core::bc::model::*;
 use neolink_core::bc::xml::*;
 use neolink_core::bcmedia::model::*;
 use neolink_core::test_server::{encode_bcmedia, make_aes_key, ServerCodec};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -68,8 +69,9 @@ struct Conn {
     out: mpsc::Sender<Vec<u8>>,
     nonce: String,
     logged_in: bool,
-    /// msg_num of the currently running video subscription, if any.
-    video: Option<tokio::task::JoinHandle<()>>,
+    /// The running video streams, by the msg_num that started them. Like a
+    /// real camera, several can run at once on one connection.
+    video: HashMap<u16, tokio::task::JoinHandle<()>>,
     mode: watch::Receiver<Mode>,
     frames: Arc<Vec<AccessUnit>>,
 }
@@ -362,7 +364,12 @@ impl Conn {
                 self.start_video(meta).await
             }
             (MSG_ID_VIDEO_STOP, _) => {
-                if let Some(handle) = self.video.take() {
+                info!(
+                    "stop_video: channel {} stream_type {} msg_num {}",
+                    meta.channel_id, meta.stream_type, meta.msg_num
+                );
+                // neolink stops a stream with the msg_num that started it
+                if let Some(handle) = self.video.remove(&meta.msg_num) {
                     handle.abort();
                 }
                 self.ack(&meta).await
@@ -378,7 +385,7 @@ impl Conn {
 
     /// Reply 200 with a BcMedia InfoV2 header, then pump frames forever.
     async fn start_video(&mut self, meta: BcMeta) -> Result<()> {
-        if let Some(handle) = self.video.take() {
+        if let Some(handle) = self.video.remove(&meta.msg_num) {
             handle.abort();
         }
         info!(
@@ -503,14 +510,14 @@ impl Conn {
                 }
             }
         });
-        self.video = Some(handle);
+        self.video.insert(meta.msg_num, handle);
         Ok(())
     }
 }
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        if let Some(handle) = self.video.take() {
+        for (_, handle) in self.video.drain() {
             handle.abort();
         }
     }
@@ -545,7 +552,7 @@ pub async fn serve(
         out: out_tx,
         nonce: make_nonce(),
         logged_in: false,
-        video: None,
+        video: HashMap::new(),
         mode,
         frames,
     };

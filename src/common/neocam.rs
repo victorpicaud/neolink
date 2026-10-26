@@ -23,10 +23,14 @@ use super::{
     Backoff, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance,
     Permit, UseCounter,
 };
+#[cfg(feature = "gstreamer")]
+use super::{HubSubscription, StreamHub};
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
 use crate::{config::CameraConfig, AnyResult, Result};
 use neolink_core::bc_protocol::BcCamera;
+#[cfg(feature = "gstreamer")]
+use {neolink_core::bc_protocol::StreamKind, std::collections::HashMap};
 
 #[allow(dead_code)]
 pub(crate) enum NeoCamCommand {
@@ -41,6 +45,9 @@ pub(crate) enum NeoCamCommand {
     #[cfg(feature = "pushnoti")]
     PushNoti(OneshotSender<WatchReceiver<Option<PushNoti>>>),
     GetUid(OneshotSender<String>),
+    /// A subscription to the camera's stream, which runs once for all of them
+    #[cfg(feature = "gstreamer")]
+    Stream(StreamKind, OneshotSender<Option<HubSubscription>>),
 }
 /// The underlying camera binding
 pub(crate) struct NeoCam {
@@ -93,6 +100,8 @@ impl NeoCam {
                     Result::Ok(())
                 },
                 v = async {
+                    #[cfg(feature = "gstreamer")]
+                    let mut hubs: HashMap<StreamKind, StreamHub> = HashMap::new();
                     while let Some(command) = commander_rx.next().await {
                         match command {
                             NeoCamCommand::HangUp => {
@@ -152,6 +161,25 @@ impl NeoCam {
                                     AnyResult::Ok(())
                                 });
                             },
+                            #[cfg(feature = "gstreamer")]
+                            NeoCamCommand::Stream(stream, sender) => {
+                                let subscription = match hubs.get(&stream).and_then(StreamHub::subscribe) {
+                                    Some(subscription) => Some(subscription),
+                                    // The first, or the hub stopped
+                                    None => {
+                                        let instance = NeoInstance::new(
+                                            camera_watch_rx.clone(),
+                                            thread_commander_tx.clone(),
+                                            thread_cancel.clone(),
+                                        )?;
+                                        let hub = StreamHub::for_camera(instance, thread_watch_config_rx.clone(), stream);
+                                        let subscription = hub.subscribe();
+                                        hubs.insert(stream, hub);
+                                        subscription
+                                    }
+                                };
+                                let _ = sender.send(subscription);
+                            }
                         }
                     }
                     Ok(())

@@ -1,5 +1,7 @@
 mod backoff;
 mod camthread;
+#[cfg(feature = "gstreamer")]
+mod hub;
 mod instance;
 mod mdthread;
 mod neocam;
@@ -11,6 +13,8 @@ mod usecounter;
 
 pub(crate) use backoff::*;
 pub(crate) use camthread::*;
+#[cfg(feature = "gstreamer")]
+pub(crate) use hub::*;
 pub(crate) use instance::*;
 pub(crate) use mdthread::*;
 pub(crate) use neocam::*;

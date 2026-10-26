@@ -26,12 +26,6 @@ impl UseCounter {
         res.activate().await?;
         Ok(res)
     }
-
-    #[cfg(feature = "gstreamer")]
-    #[allow(dead_code)]
-    pub(crate) async fn create_deactivated(&self) -> Result<Permit> {
-        Ok(Permit::new(self))
-    }
 }
 
 pub(crate) struct Permit {
@@ -40,15 +34,6 @@ pub(crate) struct Permit {
 }
 
 impl Permit {
-    #[cfg(feature = "gstreamer")]
-    #[allow(dead_code)]
-    pub(crate) fn subscribe(&self) -> Self {
-        Self {
-            is_active: false,
-            value: self.value.clone(),
-        }
-    }
-
     fn new(source: &UseCounter) -> Self {
         Self {
             is_active: false,

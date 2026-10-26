@@ -39,6 +39,9 @@ for control_port in 19111 19112; do
   python3 "$CTL" "127.0.0.1:$control_port" freeze > /dev/null 2>&1 \
     || fail "could not freeze the camera on control port $control_port"
 done
+# For a few seconds, a new client still gets the frames from just before the
+# freeze, as they were live a moment ago
+sleep 4
 
 PROBES=()
 # timed_probe CAMERA: probes the camera's main stream in the background,

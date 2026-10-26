@@ -7,6 +7,26 @@ type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>
 
 // PAD_SIZE: Media packets use 8 byte padding
 const PAD_SIZE: u32 = 8;
+/// A video frame larger than this is taken for corruption. Without a cap, a
+/// corrupt size made the stream wait for gigabytes that never come.
+const MAX_FRAME_SIZE: u32 = 8 * 1024 * 1024;
+/// The same for the extra header a video frame may carry
+const MAX_ADDITIONAL_HEADER_SIZE: u32 = 4096;
+
+/// Where the next thing that looks like the start of a media packet is
+pub(crate) fn find_magic(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| {
+        matches!(
+            u32::from_le_bytes([window[0], window[1], window[2], window[3]]),
+            MAGIC_HEADER_BCMEDIA_INFO_V1
+                | MAGIC_HEADER_BCMEDIA_INFO_V2
+                | MAGIC_HEADER_BCMEDIA_IFRAME..=MAGIC_HEADER_BCMEDIA_IFRAME_LAST
+                | MAGIC_HEADER_BCMEDIA_PFRAME..=MAGIC_HEADER_BCMEDIA_PFRAME_LAST
+                | MAGIC_HEADER_BCMEDIA_AAC
+                | MAGIC_HEADER_BCMEDIA_ADPCM
+        )
+    })
+}
 
 impl BcMedia {
     pub(crate) fn deserialize(buf: &mut BytesMut) -> Result<BcMedia, Error> {
@@ -167,8 +187,14 @@ fn bcmedia_iframe(buf: &[u8]) -> IResult<&[u8], BcMediaIframe> {
         "Video Type is unrecognised in IFrame",
         verify(take4, |x| matches!(x, "H264" | "H265")),
     )(buf)?;
-    let (buf, payload_size) = le_u32(buf)?;
-    let (buf, additional_header_size) = le_u32(buf)?;
+    let (buf, payload_size) = context(
+        "IFrame is implausibly large",
+        verify(le_u32, |x| *x <= MAX_FRAME_SIZE),
+    )(buf)?;
+    let (buf, additional_header_size) = context(
+        "IFrame header is implausibly large",
+        verify(le_u32, |x| *x <= MAX_ADDITIONAL_HEADER_SIZE),
+    )(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
     let (buf, _unknown_b) = le_u32(buf)?;
     let (buf, time) = if additional_header_size >= 4 {
@@ -216,8 +242,14 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
         "Video Type is unrecognised in PFrame",
         verify(take4, |x| matches!(x, "H264" | "H265")),
     )(buf)?;
-    let (buf, payload_size) = le_u32(buf)?;
-    let (buf, additional_header_size) = le_u32(buf)?;
+    let (buf, payload_size) = context(
+        "PFrame is implausibly large",
+        verify(le_u32, |x| *x <= MAX_FRAME_SIZE),
+    )(buf)?;
+    let (buf, additional_header_size) = context(
+        "PFrame header is implausibly large",
+        verify(le_u32, |x| *x <= MAX_ADDITIONAL_HEADER_SIZE),
+    )(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
     let (buf, _unknown_b) = le_u32(buf)?;
     let (buf, _additional_header) = take(additional_header_size)(buf)?;

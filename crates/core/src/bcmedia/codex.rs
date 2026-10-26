@@ -2,9 +2,9 @@
 //!
 //! BcMediaCodex is used with a `[tokio_util::codec::Framed]` to form complete packets
 //!
-use crate::bcmedia::model::*;
+use crate::bcmedia::{de::find_magic, model::*};
 use crate::{Error, Result};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use log::*;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -68,20 +68,70 @@ impl Decoder for BcMediaCodex {
                 Err(e) => {
                     if self.strict {
                         return Err(e);
-                    } else if src.is_empty() {
-                        return Ok(None);
-                    } else {
-                        if self.amount_skipped == 0 {
-                            debug!("Error in stream attempting to restore");
-                            trace!("   Stream Error: {:?}", e);
-                        }
-                        // Drop the whole packet and wait for a packet that starts with magic
-                        self.amount_skipped += src.len();
-                        src.clear();
-                        continue;
                     }
+                    if self.amount_skipped == 0 {
+                        debug!("Error in stream attempting to restore");
+                        trace!("   Stream Error: {:?}", e);
+                    }
+                    // Skip to the next thing that looks like the start of a
+                    // packet. Clearing the whole buffer threw that away too,
+                    // and the stream could go on failing for good.
+                    let skip = match src.get(1..).and_then(find_magic) {
+                        Some(at) => at + 1,
+                        // A magic may still start in the last three bytes
+                        None => src.len().saturating_sub(3),
+                    };
+                    if skip == 0 {
+                        return Ok(None);
+                    }
+                    self.amount_skipped += skip;
+                    src.advance(skip);
+                    continue;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn iframe(n: u8) -> Vec<u8> {
+        BcMedia::Iframe(BcMediaIframe {
+            video_type: VideoType::H264,
+            microseconds: 0,
+            time: None,
+            data: vec![n; 16],
+        })
+        .serialize(vec![])
+        .unwrap()
+    }
+
+    fn frame_number(media: Option<BcMedia>) -> u8 {
+        match media {
+            Some(BcMedia::Iframe(BcMediaIframe { data, .. })) => data[0],
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn garbage_before_a_frame_is_skipped() {
+        let mut codec = BcMediaCodex::new(false);
+        let mut buf = BytesMut::from(&b"not media"[..]);
+        buf.extend_from_slice(&iframe(1));
+        assert_eq!(frame_number(codec.decode(&mut buf).unwrap()), 1);
+    }
+
+    #[test]
+    fn an_implausible_size_is_skipped_not_waited_for() {
+        let mut codec = BcMediaCodex::new(false);
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&MAGIC_HEADER_BCMEDIA_IFRAME.to_le_bytes());
+        buf.extend_from_slice(b"H264");
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // payload size
+        buf.extend_from_slice(&[0; 12]);
+        buf.extend_from_slice(&iframe(2));
+        assert_eq!(frame_number(codec.decode(&mut buf).unwrap()), 2);
     }
 }

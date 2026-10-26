@@ -1,10 +1,13 @@
 use super::model::*;
 use crate::Error;
+#[cfg(any(test, feature = "test-server"))]
 use bytes::{Buf, BytesMut};
 use log::*;
+#[cfg(any(test, feature = "test-server"))]
+use nom::Parser;
 use nom::{
     bytes::streaming::take, combinator::*, error::context as error_context, number::streaming::*,
-    sequence::*, Parser,
+    sequence::*,
 };
 use std::{
     sync::{Mutex, PoisonError},
@@ -16,6 +19,10 @@ type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>
 impl Bc {
     /// Returns Ok(deserialized data, the amount of data consumed)
     /// Can then use this as the amount that should be remove from a buffer
+    ///
+    /// The camera's messages go through [`super::codex::BcCodex`], which splits
+    /// whole frames off the stream first. This is left for the fake camera.
+    #[cfg(any(test, feature = "test-server"))]
     pub(crate) fn deserialize(context: &BcContext, buf: &mut BytesMut) -> Result<Bc, Error> {
         let parser = BcParser { context };
         let (result, amount) = match consumed(parser)(buf) {
@@ -28,16 +35,52 @@ impl Bc {
     }
 }
 
+/// Parses just a header off the front of `buf`: the header and how long it
+/// is, or None until enough bytes have arrived
+pub(super) fn parse_header(buf: &[u8]) -> Result<Option<(BcHeader, usize)>, Error> {
+    match bc_header(buf) {
+        Ok((rest, header)) => Ok(Some((header, buf.len() - rest.len()))),
+        Err(nom::Err::Incomplete(_)) => Ok(None),
+        Err(e) => Err(Error::from(e)),
+    }
+}
+
+impl Bc {
+    /// Parses the body of a frame already split off the stream whole. Every
+    /// byte of the body is accounted for, even those no parser reads, like
+    /// the rest of a legacy message.
+    pub(super) fn parse_body(
+        context: &BcContext,
+        header: &BcHeader,
+        body: &[u8],
+    ) -> Result<Bc, Error> {
+        match bc_body(context, header, body) {
+            Ok((_, body)) => Ok(Bc {
+                meta: header.to_meta(),
+                body,
+            }),
+            // The frame is complete, so wanting more of it means it is broken
+            Err(nom::Err::Incomplete(_)) => {
+                Err(Error::Other("Message body is shorter than it claims"))
+            }
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-server"))]
 struct BcParser<'a> {
     context: &'a BcContext,
 }
 
+#[cfg(any(test, feature = "test-server"))]
 impl<'a> Parser<&'a [u8], Bc, nom::error::VerboseError<&'a [u8]>> for BcParser<'a> {
     fn parse(&mut self, buf: &'a [u8]) -> IResult<&'a [u8], Bc> {
         bc_msg(self.context, buf)
     }
 }
 
+#[cfg(any(test, feature = "test-server"))]
 fn bc_msg<'a>(context: &BcContext, buf: &'a [u8]) -> IResult<&'a [u8], Bc> {
     let (buf, header) = bc_header(buf)?;
     let (buf, body) = bc_body(context, &header, buf)?;
@@ -195,7 +238,11 @@ fn bc_modern_msg<'a>(
 
         let processed_payload_buf =
             encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
-        if context.in_bin_mode.contains(&(header.msg_num)) || in_binary {
+        if context
+            .in_bin_mode
+            .contains(&(header.msg_id, header.msg_num))
+            || in_binary
+        {
             payload = match (context.get_encrypted(), encrypted_len) {
                 (EncryptionProtocol::FullAes { .. }, Some(encrypted_len)) => {
                     // if if context.debug {
@@ -578,7 +625,9 @@ mod tests {
             _ => panic!(),
         }
 
-        context.in_bin_mode.insert(msg1.meta.msg_num);
+        context
+            .in_bin_mode
+            .insert((msg1.meta.msg_id, msg1.meta.msg_num));
         let msg2 = Bc::deserialize(&context, &mut BytesMut::from(&sample2[..])).unwrap();
         match msg2.body {
             BcBody::ModernMsg(ModernMsg {

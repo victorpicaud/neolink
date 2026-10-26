@@ -1,1 +1,9 @@
 Cargo.lock binary
+
+# Protocol capture samples used by the unit tests. Some contain XML text, so
+# without this a Windows checkout with core.autocrlf=true rewrites their line
+# endings and the byte-exact crypto tests fail.
+*.bin binary
+*.raw binary
+*.pcapng binary
+*.h264 binary

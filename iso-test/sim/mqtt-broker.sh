@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # neolink and its MQTT broker:
+#   - discovery tells Home Assistant when an entity is unavailable
 #   - after a network failure that the broker only notices later, neolink and
 #     its camera still show as connected
 #   - a broker that restarts, and forgets everything, gets the state back,
@@ -24,7 +25,12 @@ python3 "$ROOT/iso-test/sim/tcp_proxy.py" "$PROXY_PORT" "$MQTT_PORT" > "$WORK/pr
 PROXY_PID=$!
 PIDS+=("$PROXY_PID")
 start_fakecam m 20200 20210
-neolink_toml "$RTSP_PORT" "$PROXY_PORT" m=20200 > "$WORK/neolink.toml"
+{
+  neolink_toml "$RTSP_PORT" "$PROXY_PORT" m=20200
+  echo '[cameras.mqtt.discovery]'
+  echo 'topic = "homeassistant"'
+  echo 'features = ["motion"]'
+} > "$WORK/neolink.toml"
 start_neolink "$WORK/neolink.toml" mqtt-rtsp
 
 # retained TOPIC: the message the broker keeps on TOPIC
@@ -44,6 +50,14 @@ wait_for_retained() {
 }
 
 wait_for_retained neolink/m/status connected 60 || fail "camera m never connected"
+
+discovery=$(mosquitto_sub "${MQTT[@]}" -t 'homeassistant/#' -C 1 -W 5 2> /dev/null || true)
+if echo "$discovery" | grep -q '"payload_not_available":"disconnected"' \
+  && echo "$discovery" | grep -q '"topic":"neolink/status"'; then
+  echo "ok: discovery tells Home Assistant when an entity is unavailable"
+else
+  flunk "discovery does not tell Home Assistant when an entity is unavailable: $discovery"
+fi
 
 # The network to the broker fails. The broker notices only once the old
 # connection times out, and publishes its last will then, after neolink

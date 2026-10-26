@@ -126,15 +126,17 @@ probe() {
 
 # wait_for_codec URL CODEC: waits up to a minute for URL to serve CODEC
 wait_for_codec() {
-  local out
-  for _ in $(seq 1 60); do
+  # By the clock: a probe can take its 15s every time, and 60 of them took
+  # a quarter of an hour
+  local out deadline=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     if out=$(probe "$1" 15) && echo "$out" | grep -qx "$2"; then
       echo "ok: $1 serves $2"
       return 0
     fi
     sleep 1
   done
-  fail "$1 never served $2 (last answer: ${out:-none})"
+  fail "$1 never served $2 within a minute (last answer: ${out:-none})"
 }
 
 # wait_for_answer URL PATTERN SECONDS: waits up to SECONDS for ffprobe's

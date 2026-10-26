@@ -28,7 +28,7 @@ healthcheck() {
   "$NEOLINK_BIN" healthcheck "$@" 2>&1
 }
 
-beats=$(ls "$NEOLINK_HEALTH_DIR" 2> /dev/null | tr '\n' ' ')
+beats=$(ls "$NEOLINK_HEALTH_DIR" 2> /dev/null | tr '\n' ' ' || true)
 if out=$(healthcheck) && [ "$beats" = "camera-h neolink rtsp " ]; then
   echo "ok: healthy while neolink serves, with heartbeats from $beats"
 else

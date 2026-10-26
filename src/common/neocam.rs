@@ -108,11 +108,12 @@ impl NeoCam {
                                 let _ = result.send(instance);
                             }
                             NeoCamCommand::Motion(sender) => {
-                                md_request_tx.send(
-                                    MdRequest::Get {
-                                        sender,
-                                    }
-                                ).await?;
+                                // Never wait on another actor from this loop:
+                                // if it is busy every command would stall
+                                let md_request_tx = md_request_tx.clone();
+                                tokio::task::spawn(async move {
+                                    let _ = md_request_tx.send(MdRequest::Get { sender }).await;
+                                });
                             },
                             NeoCamCommand::Config(sender) => {
                                 let _ = sender.send(thread_watch_config_rx.clone());
@@ -137,11 +138,11 @@ impl NeoCam {
                             }
                             #[cfg(feature = "pushnoti")]
                             NeoCamCommand::PushNoti(sender) => {
-                                thread_pn_request_tx.send(
-                                    PnRequest::Get {
-                                        sender,
-                                    }
-                                ).await?;
+                                // Never wait on another actor from this loop
+                                let pn_request_tx = thread_pn_request_tx.clone();
+                                tokio::task::spawn(async move {
+                                    let _ = pn_request_tx.send(PnRequest::Get { sender }).await;
+                                });
                             },
                             NeoCamCommand::GetUid(sender) => {
                                 let mut uid_rx = uid_rx.clone();

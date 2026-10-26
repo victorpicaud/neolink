@@ -5,8 +5,6 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
 };
-#[cfg(feature = "pushnoti")]
-use tokio::time::{sleep, Duration};
 use tokio::{
     sync::{
         mpsc::{channel as mpsc, Sender as MpscSender},
@@ -42,7 +40,7 @@ impl NeoReactor {
     pub(crate) async fn new(config: Config) -> Self {
         let (commad_tx, mut command_rx) = mpsc(100);
         #[cfg(feature = "pushnoti")]
-        let (push_noti, mut pn_rx) = mpsc(10);
+        let (push_noti, mut pn_rx) = mpsc(100);
         #[cfg(feature = "pushnoti")]
         let pn_tx = push_noti.clone();
         let cancel = CancellationToken::new();
@@ -124,29 +122,13 @@ impl NeoReactor {
         #[cfg(feature = "pushnoti")]
         {
             let cancel1 = cancel.clone();
-            let mut thread_config_rx = config_tx.subscribe();
+            let thread_config_rx = config_tx.subscribe();
             set.spawn(async move {
-                let r = tokio::select! {
+                let pn = PushNotiThread::new().await?;
+                tokio::select! {
                     _ = cancel1.cancelled() => AnyResult::Ok(()),
-                    v = async {
-
-                        let mut pn = PushNotiThread::new().await?;
-                        loop {
-                            thread_config_rx.wait_for(|c| c.cameras.iter().any(|cam| cam.push_notifications)).await?; // Wait until PN are enabled
-                            let r = tokio::select!{
-                                v = pn.run(&pn_tx, &mut pn_rx) => {v},
-                                _ = thread_config_rx.wait_for(|c| c.cameras.iter().all(|cam| !cam.push_notifications)) => AnyResult::Ok(()), // Quit if PN is turned off
-                            };
-                            if r.is_err() {
-                                log::debug!("Issue with push notifier: {r:?}");
-                                sleep(Duration::from_secs(5)).await;
-                            } else {
-                                log::debug!("Push notifier reported normal shutdown. Restarting");
-                            }
-                        }
-                    } => v,
-                };
-                r
+                    v = pn.run(thread_config_rx, pn_tx, &mut pn_rx) => v,
+                }
             });
         }
 

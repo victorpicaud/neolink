@@ -9,8 +9,9 @@ use neolink_core::bc_protocol::{
 };
 use std::{
     fmt::{Display, Error as FmtError, Formatter},
-    net::{IpAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr},
     str::FromStr,
+    time::Duration,
 };
 
 pub(crate) fn timeout<F>(future: F) -> tokio::time::Timeout<F>
@@ -18,6 +19,38 @@ where
     F: std::future::Future,
 {
     tokio::time::timeout(tokio::time::Duration::from_secs(15), future)
+}
+
+/// How long a name may take to resolve
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long connecting to a camera and logging in may take, discovery
+/// included. A connection attempt that hung otherwise held up the camera
+/// until neolink restarted.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Resolves a camera's address: a host and port, or a host alone. Without
+/// blocking the runtime: a slow DNS server held up a tokio worker, and
+/// everything that ran on it.
+async fn resolve(address: &str) -> Result<(Option<u16>, Vec<IpAddr>)> {
+    if let Ok(ip) = IpAddr::from_str(address) {
+        return Ok((None, vec![ip]));
+    }
+    let lookup = async {
+        match tokio::net::lookup_host(address).await {
+            Ok(addrs) => {
+                let addrs: Vec<SocketAddr> = addrs.collect();
+                Ok((addrs.first().map(SocketAddr::port), addrs))
+            }
+            // A host without a port
+            Err(_) => Ok((None, tokio::net::lookup_host((address, 0)).await?.collect())),
+        }
+    };
+    let (port, addrs): (Option<u16>, Vec<SocketAddr>) =
+        tokio::time::timeout(LOOKUP_TIMEOUT, lookup)
+            .await
+            .map_err(|_| anyhow!("Looking up {address} took too long"))?
+            .map_err(|e: std::io::Error| anyhow!("Could not look up {address}: {e}"))?;
+    Ok((port, addrs.iter().map(SocketAddr::ip).collect()))
 }
 
 /// Runs the async part of a `Drop` on the current tokio runtime. Without one,
@@ -77,27 +110,10 @@ impl AddressOrUid {
         &self,
         camera_config: &CameraConfig,
     ) -> Result<BcCamera, Error> {
-        let (port, addrs) = {
-            if let Some(addr_str) = camera_config.camera_addr.as_ref() {
-                match addr_str.to_socket_addrs() {
-                    Ok(addr_iter) => {
-                        let mut port = None;
-                        let mut ipaddrs = vec![];
-                        for addr in addr_iter {
-                            port = Some(addr.port());
-                            ipaddrs.push(addr.ip());
-                        }
-                        Ok((port, ipaddrs))
-                    }
-                    Err(_) => match IpAddr::from_str(addr_str) {
-                        Ok(ip) => Ok((None, vec![ip])),
-                        Err(_) => Err(anyhow!("Could not parse address in config")),
-                    },
-                }
-            } else {
-                Ok((None, vec![]))
-            }
-        }?;
+        let (port, addrs) = match camera_config.camera_addr.as_ref() {
+            Some(address) => resolve(address).await?,
+            None => (None, vec![]),
+        };
 
         let options = BcCameraOpt {
             name: camera_config.name.clone(),
@@ -133,9 +149,10 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
         camera_config.name, camera_addr
     );
 
-    let camera = camera_addr
-        .connect_camera(camera_config)
+    let camera = tokio::time::timeout(CONNECT_TIMEOUT, camera_addr.connect_camera(camera_config))
         .await
+        .map_err(|_| anyhow!("Connecting took over {}s", CONNECT_TIMEOUT.as_secs()))
+        .and_then(|connected| connected)
         .with_context(|| {
             format!(
                 "Failed to connect to camera {} at {} on channel {}",
@@ -157,4 +174,26 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
     info!("{}: Connected and logged in", camera_config.name);
 
     Ok(camera)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn addresses_resolve_with_or_without_a_port() -> Result<()> {
+        let localhost = IpAddr::from_str("127.0.0.1")?;
+        assert_eq!(resolve("127.0.0.1").await?, (None, vec![localhost]));
+
+        let (port, addrs) = resolve("localhost:9000").await?;
+        assert_eq!(port, Some(9000));
+        assert!(addrs.iter().any(IpAddr::is_loopback), "{addrs:?}");
+
+        let (port, addrs) = resolve("localhost").await?;
+        assert_eq!(port, None);
+        assert!(addrs.iter().any(IpAddr::is_loopback), "{addrs:?}");
+
+        assert!(resolve("no-such-camera.invalid").await.is_err());
+        Ok(())
+    }
 }

@@ -64,6 +64,12 @@ pub(crate) type AnyResult<T> = Result<T, anyhow::Error>;
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    // In the log, where they can be found with the rest, timestamped
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("{info}");
+        default_hook(info);
+    }));
 
     info!(
         "Neolink {} {}",

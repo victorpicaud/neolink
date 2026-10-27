@@ -30,6 +30,12 @@ pub(crate) enum Discoveries {
     Battery,
     #[serde(alias = "siren", alias = "alarm")]
     Siren,
+    #[serde(alias = "talk", alias = "say", alias = "voice", alias = "speaker")]
+    Talk,
+    #[serde(alias = "pir_switch", alias = "pir_enabled")]
+    PirSwitch,
+    #[serde(alias = "wakeup", alias = "wake_up", alias = "wake")]
+    Wakeup,
 }
 
 #[derive(Debug, Clone)]
@@ -67,11 +73,15 @@ struct DiscoveryAvaliablity {
     payload_available: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload_not_available: Option<String>,
+    /// What of the message Home Assistant compares with the payloads
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_template: Option<String>,
 }
 
 /// An entity is available while both its camera and neolink are connected.
 /// Home Assistant took neither for gone: it waits for "offline" by default,
-/// which a camera never says, and neolink's own status was not watched.
+/// which a camera never says, and neolink's own status was not watched. A
+/// sleeping camera counts as connected: it wakes for its controls.
 #[derive(Serialize, Debug, Clone)]
 struct Availability {
     availability: Vec<DiscoveryAvaliablity>,
@@ -200,6 +210,33 @@ struct DiscoveryButton {
 }
 
 #[derive(Serialize, Debug)]
+struct DiscoveryText {
+    name: String,
+    unique_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    device: DiscoveryDevice,
+    #[serde(flatten)]
+    availability: Availability,
+    // Text specific
+    command_topic: String,
+    max: u16,
+}
+
+#[derive(Serialize, Debug)]
+struct DiscoveryNotify {
+    name: String,
+    unique_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    device: DiscoveryDevice,
+    #[serde(flatten)]
+    availability: Availability,
+    // Notify specific
+    command_topic: String,
+}
+
+#[derive(Serialize, Debug)]
 struct DiscoverySensor {
     name: String,
     unique_id: String,
@@ -221,11 +258,15 @@ fn availability(camera: &str) -> Availability {
                 topic: format!("neolink/{camera}/status"),
                 payload_available: Some("connected".to_string()),
                 payload_not_available: Some("disconnected".to_string()),
+                value_template: Some(
+                    "{{ 'disconnected' if value == 'disconnected' else 'connected' }}".to_string(),
+                ),
             },
             DiscoveryAvaliablity {
                 topic: "neolink/status".to_string(),
                 payload_available: Some("connected".to_string()),
                 payload_not_available: Some("offline".to_string()),
+                value_template: None,
             },
         ],
         availability_mode: "all".to_string(),
@@ -651,6 +692,150 @@ pub(crate) async fn enable_discovery(
                     )
                 })?;
             }
+            Discoveries::Talk => {
+                // What the camera says, typed on a dashboard
+                let config_data = DiscoveryText {
+                    // Common across all potential features
+                    device: device.clone(),
+                    availability: availability.clone(),
+
+                    // Identifiers
+                    name: format!("{} Say", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_say", cam_config.name),
+                    icon: Some("mdi:account-voice".to_string()),
+
+                    // Text specific
+                    command_topic: format!("neolink/{}/control/say", cam_config.name),
+                    // The most Home Assistant takes
+                    max: 255,
+                };
+
+                // Each feature needs to be individually registered
+                mqtt.send_message_with_root_topic(
+                    &format!("{}/text/{}", discovery_config.topic, config_data.unique_id),
+                    "config",
+                    &serde_json::to_string(&config_data)
+                        .with_context(|| "Cound not serialise discovery say config into json")?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish say auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+
+                // What automations have it say, with notify.send_message
+                let config_data = DiscoveryNotify {
+                    // Common across all potential features
+                    device: device.clone(),
+                    availability: availability.clone(),
+
+                    // Identifiers
+                    name: format!("{} Speaker", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_speaker", cam_config.name),
+                    icon: Some("mdi:speaker-message".to_string()),
+
+                    // Notify specific
+                    command_topic: format!("neolink/{}/control/say", cam_config.name),
+                };
+
+                // Each feature needs to be individually registered
+                mqtt.send_message_with_root_topic(
+                    &format!(
+                        "{}/notify/{}",
+                        discovery_config.topic, config_data.unique_id
+                    ),
+                    "config",
+                    &serde_json::to_string(&config_data).with_context(|| {
+                        "Cound not serialise discovery speaker config into json"
+                    })?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish speaker auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+            }
+            Discoveries::PirSwitch => {
+                let config_data = DiscoverySwitch {
+                    // Common across all potential features
+                    device: device.clone(),
+                    availability: availability.clone(),
+
+                    // Identifiers
+                    name: format!("{} PIR", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_pir", cam_config.name),
+                    icon: Some("mdi:motion-sensor".to_string()),
+
+                    // Switch specific
+                    command_topic: format!("neolink/{}/control/pir", cam_config.name),
+                    payload_off: "off".to_string(),
+                    payload_on: "on".to_string(),
+                    state_topic: None,
+                    state_off: None,
+                    state_on: None,
+                };
+
+                // Each feature needs to be individually registered
+                mqtt.send_message_with_root_topic(
+                    &format!(
+                        "{}/switch/{}",
+                        discovery_config.topic, config_data.unique_id
+                    ),
+                    "config",
+                    &serde_json::to_string(&config_data)
+                        .with_context(|| "Cound not serialise discovery pir config into json")?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish pir auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+            }
+            Discoveries::Wakeup => {
+                let config_data = DiscoveryButton {
+                    // Common across all potential features
+                    device: device.clone(),
+                    availability: availability.clone(),
+
+                    // Identifiers
+                    name: format!("{} Wake Up", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_wakeup", cam_config.name),
+                    icon: Some("mdi:sleep-off".to_string()),
+
+                    // Button specific: for five minutes, long enough for its
+                    // preview and battery level to be updated
+                    command_topic: format!("neolink/{}/control/wakeup", cam_config.name),
+                    payload_press: Some("5".to_string()),
+                };
+
+                // Each feature needs to be individually registered
+                mqtt.send_message_with_root_topic(
+                    &format!(
+                        "{}/button/{}",
+                        discovery_config.topic, config_data.unique_id
+                    ),
+                    "config",
+                    &serde_json::to_string(&config_data)
+                        .with_context(|| "Cound not serialise discovery wakeup config into json")?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish wakeup auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+            }
         }
     }
 
@@ -668,12 +853,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_feature_is_known_by_its_name_in_the_readme() {
+        for (name, feature) in [
+            ("talk", Discoveries::Talk),
+            ("pir_switch", Discoveries::PirSwitch),
+            ("wakeup", Discoveries::Wakeup),
+            ("pir", Discoveries::Motion),
+        ] {
+            let parsed: Discoveries = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            assert_eq!(parsed, feature, "{name}");
+        }
+    }
+
+    #[test]
     fn an_entity_is_unavailable_when_its_camera_or_neolink_is_gone() {
         let json = serde_json::to_value(availability("cam")).unwrap();
         assert_eq!(json["availability_mode"], "all");
         let topics = json["availability"].as_array().unwrap();
         assert_eq!(topics[0]["topic"], "neolink/cam/status");
         assert_eq!(topics[0]["payload_not_available"], "disconnected");
+        // Sleeping included
+        assert_eq!(
+            topics[0]["value_template"],
+            "{{ 'disconnected' if value == 'disconnected' else 'connected' }}"
+        );
         assert_eq!(topics[1]["topic"], "neolink/status");
         assert_eq!(topics[1]["payload_not_available"], "offline");
     }

@@ -308,6 +308,16 @@ impl NeoInstance {
         Ok(instance_rx.await?)
     }
 
+    /// Whether neolink wants the camera connected, as it changes: with
+    /// `idle_disconnect`, it lets the camera go while nothing needs it
+    pub(crate) async fn wanted_state(&self) -> Result<WatchReceiver<NeoCamThreadState>> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::StateWatch(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
     pub(crate) async fn permit(&self) -> Result<Permit> {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control

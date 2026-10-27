@@ -17,11 +17,14 @@
 //! - `/control/ptz` [up|down|left|right|in|out] (amount) Control the PTZ movements, amount defaults to 32.0
 //! - `/control/ptz/preset` [id] Move the camera to a known preset
 //! - `/control/ptz/assign` [id] [name] Assign the current ptz position to an ID and name
+//! - `/control/say` [text] Speaks the text through the camera, with the `say_command` of its config
+//! - `/control/talk` [url] Plays the sound file at an http or https URL through the camera
 //!
 //! Status Messages:
 //!
 //! `/status offline` Sent when the neolink goes offline this is a LastWill message
 //! `/status disconnected` Sent when the camera goes offline
+//! `/status sleeping` Sent when neolink lets the camera sleep, with `idle_disconnect`
 //! `/status/battery` Sent in reply to a `/query/battery`
 //! `/status/pir` Sent in reply to a `/query/pir`
 //! `/status/ptz/preset` Sent in reply to a `/query/ptz/preset`
@@ -67,7 +70,7 @@ use std::{
 use tokio::{
     sync::mpsc::channel as mpsc,
     task::JoinSet,
-    time::{interval, sleep, timeout, Duration, MissedTickBehavior},
+    time::{interval, sleep, sleep_until, timeout, Duration, Instant, MissedTickBehavior},
 };
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -78,9 +81,10 @@ use neolink_core::bc_protocol::{Direction as BcDirection, LightState};
 mod cmdline;
 mod discovery;
 mod mqttc;
+mod speaker;
 
 use crate::{
-    common::{supervise_cameras, MdState, NeoInstance, NeoReactor},
+    common::{supervise_cameras, MdState, NeoCamThreadState, NeoInstance, NeoReactor},
     config::Config,
     AnyResult,
 };
@@ -94,6 +98,7 @@ use mqttc::{Mqtt, MqttReplyRef};
 use self::{
     discovery::enable_discovery,
     mqttc::{MqttInstance, MqttReply},
+    speaker::Speaker,
 };
 
 /// Entry point for the mqtt subcommand
@@ -193,6 +198,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor, stop: CancellationToken) -
                         let mut config = config?;
 
                         fill_in_passwords(&mut config, &curr_config);
+                        keep_say_commands(&mut config, &curr_config);
 
                         let validate = config.validate().with_context(|| {
                             format!("Failed to validate the MQTT {:?} config file", msg.topic)
@@ -314,6 +320,26 @@ fn fill_in_passwords(config: &mut Config, current: &Config) {
     }
 }
 
+/// Keeps the say commands of `current`. Neolink does not publish them, so a
+/// config sent over MQTT leaves them out, and one sent with them would have
+/// neolink run what whoever can publish to the broker likes.
+fn keep_say_commands(config: &mut Config, current: &Config) {
+    for cam in config.cameras.iter_mut() {
+        cam.mqtt.say_command = current
+            .cameras
+            .iter()
+            .find(|c| c.name == cam.name)
+            .and_then(|c| c.mqtt.say_command.clone());
+    }
+}
+
+/// Whether `url` is an http or an https one
+fn is_web_url(url: &str) -> bool {
+    let url = url.to_ascii_lowercase();
+    (url.starts_with("http://") || url.starts_with("https://"))
+        && !url.contains(char::is_whitespace)
+}
+
 async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> Result<()> {
     let mut watch_config = camera.config().await?;
     let camera_name = watch_config.borrow().name.clone();
@@ -352,8 +378,10 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                 let mut mqtt_msg = mqtt_instance.resubscribe().await?;
                 let cancel_msg = cancel.clone();
                 let mut set_msg = JoinSet::new();
+                let speaker = Arc::new(Speaker::new());
 
                 let mut camera_watch = camera.camera();
+                let camera_wanted = camera.clone();
                 let mqtt_watch = mqtt_instance.resubscribe().await?;
 
                 let camera_floodlight = camera.clone();
@@ -389,11 +417,12 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                     let camera_msg = camera_msg.clone();
                                     let tx = tx.clone();
                                     let cancel_msg = cancel_msg.clone();
+                                    let speaker = speaker.clone();
                                     set_msg.spawn(async move {
                                         tokio::select!{
                                             _ = cancel_msg.cancelled() => AnyResult::Ok(()),
                                             v = async {
-                                                let res = handle_mqtt_message(msg, &mqtt_msg, &camera_msg).await;
+                                                let res = handle_mqtt_message(msg, &mqtt_msg, &camera_msg, &speaker).await;
                                                 if res.is_err() {
                                                     tx.send(res).await?;
                                                 }
@@ -417,20 +446,46 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     } => v,
                     // Handle camera disconnect/connect
                     v = async {
+                        let mut wanted = camera_wanted.wanted_state().await?;
+                        // As published above
+                        let mut presence = Presence::Disconnected;
+                        let mut waking_since = None;
                         loop {
-                            camera_watch.wait_for(|cam| cam.upgrade().is_some()).await.with_context(|| {
-                                format!("{}: Online Watch Dropped", camera_name)
-                            })?;
-                            log::trace!("Publish online");
-                            mqtt_watch.send_message("status", "connected", true).await.with_context(|| {
-                                format!("{}: Failed to publish connected", camera_name)
-                            })?;
-                            camera_watch.wait_for(|cam| cam.upgrade().is_none()).await.with_context(|| {
-                                format!("{}: Disconnect Watch Dropped", camera_name)
-                            })?;
-                            mqtt_watch.send_message("status", "disconnected", true).await.with_context(|| {
-                                format!("{}: Failed to publish disconnected", camera_name)
-                            })?;
+                            let connected = camera_watch.borrow_and_update().upgrade().is_some();
+                            let wants = matches!(*wanted.borrow_and_update(), NeoCamThreadState::Connected);
+                            let waking_for = if !connected && wants {
+                                waking_since.get_or_insert_with(Instant::now).elapsed()
+                            } else {
+                                waking_since = None;
+                                Duration::ZERO
+                            };
+                            let next = presence.next(connected, wants, waking_for);
+                            if next != presence {
+                                log::trace!("Publish {}", next.as_str());
+                                mqtt_watch.send_message("status", next.as_str(), true).await.with_context(|| {
+                                    format!("{}: Failed to publish {}", camera_name, next.as_str())
+                                })?;
+                                presence = next;
+                            }
+                            // A sleeping camera that does not wake in time is gone
+                            let woken_by = match (presence, waking_since) {
+                                (Presence::Sleeping, Some(since)) => Some(since + Presence::WAKE_TIME),
+                                _ => None,
+                            };
+                            tokio::select! {
+                                v = camera_watch.changed() => v.with_context(|| {
+                                    format!("{}: Online Watch Dropped", camera_name)
+                                })?,
+                                v = wanted.changed() => v.with_context(|| {
+                                    format!("{}: State Watch Dropped", camera_name)
+                                })?,
+                                _ = async {
+                                    match woken_by {
+                                        Some(at) => sleep_until(at).await,
+                                        None => futures::future::pending().await,
+                                    }
+                                } => {}
+                            }
                         }
                     } => {
                         v
@@ -640,6 +695,47 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
     Ok(())
 }
 
+/// What neolink says of a camera on `neolink/{CAMERANAME}/status`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    Connected,
+    /// Let go of on purpose, as a battery camera that nothing needs, with
+    /// `idle_disconnect`. Asked to do anything, it wakes, so Home Assistant
+    /// keeps its controls: it used to say disconnected, and they were
+    /// unavailable for as long as the camera slept.
+    Sleeping,
+    /// Lost while needed, or did not wake in time
+    Disconnected,
+}
+
+impl Presence {
+    /// How long a sleeping camera may take to wake, before it counts as gone
+    const WAKE_TIME: Duration = Duration::from_secs(60);
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Sleeping => "sleeping",
+            Self::Disconnected => "disconnected",
+        }
+    }
+
+    /// What comes after `self`, from whether the camera is connected, whether
+    /// neolink wants it to be, and how long it has wanted it
+    fn next(self, connected: bool, wanted: bool, waking_for: Duration) -> Self {
+        match (connected, wanted) {
+            (true, _) => Self::Connected,
+            // One that could not be reached too: it may well wake next time,
+            // and Home Assistant would not ask it to while it is unavailable
+            (false, false) => Self::Sleeping,
+            (false, true) if self == Self::Sleeping && waking_for < Self::WAKE_TIME => {
+                Self::Sleeping
+            }
+            (false, true) => Self::Disconnected,
+        }
+    }
+}
+
 /// Whether the camera does not support a request, or answers it in a way that
 /// cannot be understood: asking again would not help
 fn is_unsupported(e: &anyhow::Error) -> bool {
@@ -665,6 +761,7 @@ async fn handle_mqtt_message(
     msg: MqttReply,
     mqtt: &MqttInstance,
     camera: &NeoInstance,
+    speaker: &Speaker,
 ) -> Result<()> {
     match msg.as_ref() {
         MqttReplyRef {
@@ -862,7 +959,7 @@ async fn handle_mqtt_message(
                 "OK"
             }
             .to_string();
-            mqtt.send_message("control/ir", &reply, false)
+            mqtt.send_message("control/reboot", &reply, false)
                 .await
                 .with_context(|| "Failed to publish reboot on the camera")?;
         }
@@ -998,7 +1095,7 @@ async fn handle_mqtt_message(
                 "FAIL"
             }
             .to_string();
-            mqtt.send_message("control/ir", &reply, false)
+            mqtt.send_message("control/ptz/preset", &reply, false)
                 .await
                 .with_context(|| "Failed to publish ptz move")?;
         }
@@ -1037,7 +1134,7 @@ async fn handle_mqtt_message(
                 "FAIL"
             }
             .to_string();
-            mqtt.send_message("control/ir", &reply, false)
+            mqtt.send_message("control/ptz/assign", &reply, false)
                 .await
                 .with_context(|| "Failed to publish ptz move")?;
         }
@@ -1184,6 +1281,49 @@ async fn handle_mqtt_message(
             mqtt.send_message("control/siren", &reply, false)
                 .await
                 .with_context(|| "Failed to publish siren")?;
+        }
+        MqttReplyRef {
+            topic: "control/say",
+            message,
+        } => {
+            let command = camera.config().await?.borrow().mqtt.say_command.clone();
+            let text = message.trim();
+            let reply = match command {
+                None => "FAIL: The camera has no say_command in its config".to_string(),
+                Some(_) if text.is_empty() => "FAIL: There is nothing to say".to_string(),
+                Some(command) => match speaker.say(camera, &command, text).await {
+                    Ok(()) => "OK".to_string(),
+                    Err(e) => {
+                        error!("Failed to say {text:?}: {e:?}");
+                        format!("FAIL: {e:#}")
+                    }
+                },
+            };
+            mqtt.send_message("control/say", &reply, false)
+                .await
+                .with_context(|| "Failed to publish say")?;
+        }
+        MqttReplyRef {
+            topic: "control/talk",
+            message,
+        } => {
+            let url = message.trim();
+            // Not a path: whoever can publish to the broker could play any
+            // file of the host of neolink
+            let reply = if is_web_url(url) {
+                match speaker.talk(camera, url).await {
+                    Ok(()) => "OK".to_string(),
+                    Err(e) => {
+                        error!("Failed to play {url}: {e:?}");
+                        format!("FAIL: {e:#}")
+                    }
+                }
+            } else {
+                "FAIL: Only an http or https URL plays".to_string()
+            };
+            mqtt.send_message("control/talk", &reply, false)
+                .await
+                .with_context(|| "Failed to publish talk")?;
         }
         MqttReplyRef {
             topic: "query/battery",
@@ -1455,5 +1595,76 @@ mod tests {
 
         let broker_elsewhere = from_mqtt("elsewhere");
         assert_eq!(broker_elsewhere.mqtt.unwrap().credentials, None);
+    }
+
+    #[test]
+    fn a_config_sent_over_mqtt_keeps_the_say_commands_of_the_file() {
+        let config = |say: &str| -> Config {
+            toml::from_str(&format!(
+                r#"
+                [[cameras]]
+                name = "cam"
+                username = "admin"
+                address = "10.0.0.1:9000"
+                [cameras.mqtt]
+                {say}
+
+                [[cameras]]
+                name = "new"
+                username = "admin"
+                address = "10.0.0.2:9000"
+                [cameras.mqtt]
+                {say}
+                "#
+            ))
+            .unwrap()
+        };
+        let current = config(r#"say_command = ["piper"]"#);
+        let file = Some(vec!["piper".to_string()]);
+
+        for say in ["", r#"say_command = ["sh", "-c", "rm -rf ~"]"#] {
+            let mut from_mqtt = config(say);
+            keep_say_commands(&mut from_mqtt, &current);
+            assert_eq!(from_mqtt.cameras[0].mqtt.say_command, file, "{say}");
+        }
+        let mut renamed = config(r#"say_command = ["sh"]"#);
+        renamed.cameras[1].name = "renamed".to_string();
+        keep_say_commands(&mut renamed, &current);
+        assert_eq!(
+            renamed.cameras[1].mqtt.say_command, None,
+            "none for a camera the file does not have"
+        );
+    }
+
+    #[test]
+    fn only_a_web_url_plays() {
+        assert!(is_web_url("http://ha:8123/local/ding.mp3"));
+        assert!(is_web_url("HTTPS://example.com/a.wav"));
+        assert!(!is_web_url("file:///etc/shadow"));
+        assert!(!is_web_url("/root/neolink.toml"));
+        assert!(!is_web_url("http://a b"));
+    }
+
+    #[test]
+    fn a_camera_let_go_of_sleeps_and_one_that_does_not_wake_is_disconnected() {
+        use Presence::*;
+        let now = Duration::ZERO;
+        let soon = Duration::from_secs(5);
+        assert_eq!(Disconnected.next(true, true, now), Connected);
+        assert_eq!(Connected.next(false, false, now), Sleeping, "let go of");
+        assert_eq!(Connected.next(false, true, now), Disconnected, "lost");
+        assert_eq!(Sleeping.next(false, true, soon), Sleeping, "waking");
+        assert_eq!(Sleeping.next(true, true, soon), Connected);
+        assert_eq!(
+            Sleeping.next(false, true, Presence::WAKE_TIME),
+            Disconnected,
+            "did not wake"
+        );
+        assert_eq!(Disconnected.next(false, true, soon), Disconnected);
+        assert_eq!(
+            Disconnected.next(false, false, now),
+            Sleeping,
+            "no longer needed"
+        );
     }
 }

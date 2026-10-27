@@ -119,6 +119,10 @@ jobs:
         run: bash iso-test/sim/healthcheck.sh
       - name: End-to-end talk test
         run: bash iso-test/sim/talk.sh
+      - name: End-to-end battery camera test (over MQTT)
+        run: bash iso-test/sim/battery.sh
+      - name: End-to-end talk test (over MQTT)
+        run: bash iso-test/sim/mqtt-talk.sh
 
   check_deny:
     needs: pre_job

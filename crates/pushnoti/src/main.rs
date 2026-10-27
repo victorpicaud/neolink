@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use fcm_push_listener::*;
+use fcm_push_listener::{new_heartbeat_ack, Message, MessageStream, Registration};
 use log::*;
 use std::{fs, path::PathBuf};
+use tokio::io::AsyncWriteExt;
+use tokio_stream::StreamExt;
 use validator::Validate;
 
 mod config;
@@ -41,17 +43,13 @@ async fn main() -> Result<()> {
     // into this program
     // let registration = fcm_push_listener::register("263684512460").await?;
 
-    // let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
-    // let firebase_project_id = "reolink-login";
-    // let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
-    // let vapid_key = "";
+    // Reolink's Android app, as Firebase knows it. Registering by sender ID
+    // alone is what Google stopped taking in June 2024.
+    let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
+    let firebase_project_id = "reolink-login";
+    let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
 
-    let sender_id = "743639030586"; // andriod
-
-    // let sender_id = "696841269229"; // ios
-
-    // let sender_id = "263684512460"; // test
-
+    let http = reqwest::Client::new();
     let token_path = PathBuf::from("./token.toml");
     let registration = if let Ok(Ok(registration)) =
         fs::read_to_string(&token_path).map(|v| toml::from_str::<Registration>(&v))
@@ -60,14 +58,14 @@ async fn main() -> Result<()> {
         registration
     } else {
         info!("Registering new token");
-        let registration = fcm_push_listener::register(sender_id).await?;
-        // let registration = fcm_push_listener::register(
-        //     firebase_app_id,
-        //     firebase_project_id,
-        //     firebase_api_key,
-        //     vapid_key,
-        // )
-        // .await?;
+        let registration = fcm_push_listener::register(
+            &http,
+            firebase_app_id,
+            firebase_project_id,
+            firebase_api_key,
+            None,
+        )
+        .await?;
         let new_token = toml::to_string(&registration)?;
         fs::write(token_path, new_token)?;
         registration
@@ -81,14 +79,18 @@ async fn main() -> Result<()> {
         .await?;
 
     info!("Listening");
-    let mut listener = FcmPushListener::create(
-        registration,
-        |message: FcmMessage| {
-            info!("Message JSON: {}", message.payload_json);
-            info!("Persistent ID: {:?}", message.persistent_id);
-        },
-        vec![],
-    );
-    listener.connect().await?;
+    let session = registration.gcm.checkin(&http).await?;
+    let connection = session.new_connection(vec![]).await?;
+    let mut messages = MessageStream::wrap(connection, &registration.keys);
+    while let Some(message) = messages.next().await {
+        match message? {
+            Message::Data(data) => {
+                info!("Message JSON: {}", String::from_utf8_lossy(&data.body));
+                info!("Persistent ID: {:?}", data.persistent_id);
+            }
+            Message::HeartbeatPing => messages.write_all(&new_heartbeat_ack()).await?,
+            Message::Other(..) => {}
+        }
+    }
     Ok(())
 }

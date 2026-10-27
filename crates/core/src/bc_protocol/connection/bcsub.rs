@@ -2,17 +2,24 @@ use super::BcConnection;
 use crate::bcmedia::codex::BcMediaCodex;
 use crate::{bc::model::*, bcmedia::model::*, Error, Result};
 use futures::stream::{Stream, TryStreamExt};
-use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::io::{Error as IoError, Result as IoResult};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
+use tokio::time::{timeout, Duration};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::codec::FramedRead;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
+/// How long a reply may take. A request used to wait for its reply forever,
+/// and whatever made it waited with it.
+const RECV_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub struct BcSubscription<'a> {
     rx: ReceiverStream<Result<Bc>>,
     msg_num: Option<u32>,
+    /// Gets every message with its ID, whatever their numbers
+    events: bool,
     conn: &'a BcConnection,
 }
 
@@ -44,6 +51,17 @@ impl<'a> BcSubscription<'a> {
         BcSubscription {
             rx: ReceiverStream::new(rx),
             msg_num,
+            events: false,
+            conn,
+        }
+    }
+
+    /// A subscription to every message with an ID, whatever their numbers
+    pub fn new_events(rx: Receiver<Result<Bc>>, conn: &'a BcConnection) -> BcSubscription<'a> {
+        BcSubscription {
+            rx: ReceiverStream::new(rx),
+            msg_num: None,
+            events: true,
             conn,
         }
     }
@@ -58,8 +76,18 @@ impl<'a> BcSubscription<'a> {
         Ok(())
     }
 
+    /// The next reply, failing with [`Error::Timeout`] if none comes in 15s
     pub async fn recv(&mut self) -> Result<Bc> {
+        timeout(RECV_TIMEOUT, self.recv_untimed()).await?
+    }
+
+    /// The next message, however long it takes: for messages the camera
+    /// sends whenever it likes, like motion alarms
+    pub async fn recv_untimed(&mut self) -> Result<Bc> {
         let bc = self.rx.next().await.ok_or(Error::DroppedSubscriber)?;
+        if self.events {
+            return bc;
+        }
         if let Ok(bc) = &bc {
             if let Some(msg_num) = self.msg_num {
                 assert!(bc.meta.msg_num as u32 == msg_num);
@@ -87,7 +115,7 @@ impl<'a> BcSubscription<'a> {
                     }),
             }) => Some(Ok(data)),
             Ok(_) => None,
-            Err(e) => Some(Err(IoError::new(ErrorKind::Other, e))),
+            Err(e) => Some(Err(IoError::other(e))),
         })
     }
 

@@ -5,8 +5,6 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
 };
-#[cfg(feature = "pushnoti")]
-use tokio::time::{sleep, Duration};
 use tokio::{
     sync::{
         mpsc::{channel as mpsc, Sender as MpscSender},
@@ -25,6 +23,8 @@ use crate::{config::Config, AnyResult, Result};
 #[allow(clippy::large_enum_variant)]
 enum NeoReactorCommand {
     HangUp,
+    /// Stops every camera, logged out, then the reactor
+    Shutdown(OneshotSender<()>),
     Config(OneshotSender<WatchReceiver<Config>>),
     UpdateConfig(Config, OneshotSender<Result<()>>),
     Get(String, OneshotSender<Result<Option<NeoInstance>>>),
@@ -42,7 +42,7 @@ impl NeoReactor {
     pub(crate) async fn new(config: Config) -> Self {
         let (commad_tx, mut command_rx) = mpsc(100);
         #[cfg(feature = "pushnoti")]
-        let (push_noti, mut pn_rx) = mpsc(10);
+        let (push_noti, mut pn_rx) = mpsc(100);
         #[cfg(feature = "pushnoti")]
         let pn_tx = push_noti.clone();
         let cancel = CancellationToken::new();
@@ -69,26 +69,43 @@ impl NeoReactor {
                                 cancel2.cancel();
                                 return Result::<(), anyhow::Error>::Ok(());
                             }
+                            NeoReactorCommand::Shutdown(reply) => {
+                                // All at once, as each may have to wait for
+                                // its camera
+                                let mut stopping = JoinSet::new();
+                                for (_, camera) in instances.drain() {
+                                    stopping.spawn(camera.shutdown());
+                                }
+                                while stopping.join_next().await.is_some() {}
+                                cancel2.cancel();
+                                let _ = reply.send(());
+                                return Ok(());
+                            }
                             NeoReactorCommand::Config(reply) =>  {
                                 let _ = reply.send(thread_config_tx.subscribe());
                             }
                             NeoReactorCommand::Get(name, sender) => {
+                                // A camera whose actor ended answers nothing:
+                                // it starts again instead
+                                if instances.get(&name).is_some_and(NeoCam::is_dead) {
+                                    log::info!("{name}: Starting the camera again");
+                                    instances.remove(&name);
+                                }
+                                // A camera that fails to start fails the
+                                // request, and no longer every camera with it
                                 let new = match instances.entry(name.clone()) {
-                                    Entry::Occupied(occ) => Result::Ok(Some(occ.get().subscribe().await?)),
+                                    Entry::Occupied(occ) => occ.get().subscribe().await.map(Some),
                                     Entry::Vacant(vac) => {
                                         let current_config: Config = (*thread_config_tx.borrow()).clone();
                                         if let Some(config) = current_config.cameras.iter().find(|cam| cam.name == name).cloned() {
                                             #[cfg(feature = "pushnoti")]
-                                            let cam = NeoCam::new(config, push_noti.clone()).await?;
+                                            let cam = NeoCam::new(config, push_noti.clone()).await;
                                             #[cfg(not(feature = "pushnoti"))]
-                                            let cam = NeoCam::new(config).await?;
-                                            Result::Ok(Some(
-                                                vac.insert(
-                                                    cam,
-                                                )
-                                                .subscribe()
-                                                .await?
-                                            ))
+                                            let cam = NeoCam::new(config).await;
+                                            match cam {
+                                                Ok(cam) => vac.insert(cam).subscribe().await.map(Some),
+                                                Err(e) => Err(e),
+                                            }
                                         } else {
                                             Result::Ok(None)
                                         }
@@ -99,6 +116,10 @@ impl NeoReactor {
                             NeoReactorCommand::UpdateConfig(new_conf, reply) => {
                                 // Shutdown or Notify instances of a change
                                 let mut names = new_conf.cameras.iter().filter(|cam_conf| cam_conf.enabled).map(|cam_conf| (cam_conf.name.clone(), cam_conf.clone())).collect::<HashMap<_,_>>();
+                                // Set the new conf first, so that whatever
+                                // runs a removed camera learns it was removed
+                                // before the camera goes away under it
+                                let _ = thread_config_tx.send_replace(new_conf);
                                 // Remove those no longer in the config
                                 instances.retain(|name, _| names.contains_key(name));
                                 for (name, instance) in instances.iter() {
@@ -107,8 +128,6 @@ impl NeoReactor {
                                     }
                                 }
 
-                                // Set the new conf
-                                let _ = thread_config_tx.send_replace(new_conf);
                                 // Reply that we are done
                                 let _ = reply.send(Ok(()));
                             }
@@ -124,29 +143,13 @@ impl NeoReactor {
         #[cfg(feature = "pushnoti")]
         {
             let cancel1 = cancel.clone();
-            let mut thread_config_rx = config_tx.subscribe();
+            let thread_config_rx = config_tx.subscribe();
             set.spawn(async move {
-                let r = tokio::select! {
+                let pn = PushNotiThread::new().await?;
+                tokio::select! {
                     _ = cancel1.cancelled() => AnyResult::Ok(()),
-                    v = async {
-
-                        let mut pn = PushNotiThread::new().await?;
-                        loop {
-                            thread_config_rx.wait_for(|c| c.cameras.iter().any(|cam| cam.push_notifications)).await?; // Wait until PN are enabled
-                            let r = tokio::select!{
-                                v = pn.run(&pn_tx, &mut pn_rx) => {v},
-                                _ = thread_config_rx.wait_for(|c| c.cameras.iter().all(|cam| !cam.push_notifications)) => AnyResult::Ok(()), // Quit if PN is turned off
-                            };
-                            if r.is_err() {
-                                log::debug!("Issue with push notifier: {r:?}");
-                                sleep(Duration::from_secs(5)).await;
-                            } else {
-                                log::debug!("Push notifier reported normal shutdown. Restarting");
-                            }
-                        }
-                    } => v,
-                };
-                r
+                    v = pn.run(thread_config_rx, pn_tx, &mut pn_rx) => v,
+                }
             });
         }
 
@@ -186,6 +189,21 @@ impl NeoReactor {
 
         sender_rx.await?
     }
+
+    /// Stops every camera, logged out. Cameras that were only dropped as
+    /// neolink exited never logged out: dropping left that to tasks that
+    /// exiting cut short.
+    pub(crate) async fn shutdown(&self) {
+        let (sender_tx, sender_rx) = oneshot();
+        if self
+            .commander
+            .send(NeoReactorCommand::Shutdown(sender_tx))
+            .await
+            .is_ok()
+        {
+            let _ = sender_rx.await;
+        }
+    }
 }
 
 impl Drop for NeoReactor {
@@ -195,13 +213,32 @@ impl Drop for NeoReactor {
                 log::trace!("Drop NeoReactor");
                 self.cancel.cancel();
                 let commander = self.commander.clone();
-                let _gt = tokio::runtime::Handle::current().enter();
-                tokio::task::spawn(async move {
+                crate::utils::spawn_cleanup(async move {
                     let _ = commander.send(NeoReactorCommand::HangUp).await;
                     while set.join_next().await.is_some() {}
                     log::trace!("Dropped NeoReactor");
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn shutting_down_stops_the_cameras_then_the_reactor() -> AnyResult<()> {
+        let config: Config = toml::from_str(
+            "[[cameras]]\nname = \"cam\"\nusername = \"admin\"\naddress = \"127.0.0.1:1\"\npush_notifications = false\n",
+        )?;
+        let reactor = NeoReactor::new(config).await;
+        reactor.get("cam").await?;
+
+        // Well before a camera's time to stop runs out, since none is slow
+        timeout(Duration::from_secs(2), reactor.shutdown()).await?;
+        assert!(reactor.get("cam").await.is_err(), "the reactor still runs");
+        Ok(())
     }
 }

@@ -1,59 +1,23 @@
 //! Used to track number of users of a service
-use tokio::{
-    sync::{
-        mpsc::{channel as mpsc, Sender as MpscSender},
-        watch::{channel as watch, Receiver as WatchReceiver},
-    },
-    task::JoinSet,
-};
-use tokio_util::sync::CancellationToken;
+use std::sync::Arc;
+use tokio::sync::watch::{channel as watch, Sender as WatchSender};
 
-use crate::{AnyResult, Result};
+use crate::Result;
 
 /// Counts the active users of the stream
+///
+/// The count changes synchronously, so a [`Permit`] is released wherever it
+/// is dropped, even where no tokio runtime is running. A release that went
+/// missing would keep the camera from ever going idle.
 pub(crate) struct UseCounter {
-    value: WatchReceiver<u32>,
-    notifier_tx: MpscSender<bool>,
-    cancel: CancellationToken,
-    set: JoinSet<AnyResult<()>>,
+    value: Arc<WatchSender<u32>>,
 }
 
 impl UseCounter {
     pub(crate) async fn new() -> Self {
-        let (notifier_tx, mut notifier) = mpsc(100);
-        let (value_tx, value) = watch(0);
-        let cancel = CancellationToken::new();
-        let mut set = JoinSet::new();
-
-        let thread_cancel = cancel.clone();
-        set.spawn(async move {
-            let r = tokio::select! {
-                _ = thread_cancel.cancelled() => {
-                    AnyResult::Ok(())
-                },
-                v = async {
-                    while let Some(noti) = notifier.recv().await {
-                        value_tx.send_modify(|value| {
-                            if noti {
-                                log::trace!("Usecounter: {}->{}", *value, (*value) + 1);
-                                *value += 1;
-                            } else {
-                                log::trace!("Usecounter: {}->{}", *value, (*value) - 1);
-                                *value -= 1;
-                            }
-                        });
-                    }
-                    AnyResult::Ok(())
-                } => v,
-            };
-            log::trace!("End Use Counter: {r:?}");
-            r
-        });
+        let (value, _) = watch(0);
         Self {
-            value,
-            notifier_tx,
-            cancel,
-            set,
+            value: Arc::new(value),
         }
     }
 
@@ -62,70 +26,50 @@ impl UseCounter {
         res.activate().await?;
         Ok(res)
     }
-
-    #[cfg(feature = "gstreamer")]
-    #[allow(dead_code)]
-    pub(crate) async fn create_deactivated(&self) -> Result<Permit> {
-        Ok(Permit::new(self))
-    }
-}
-
-impl Drop for UseCounter {
-    fn drop(&mut self) {
-        log::trace!("Drop UseCounter");
-        self.cancel.cancel();
-
-        let mut set = std::mem::take(&mut self.set);
-        let _gt = tokio::runtime::Handle::current().enter();
-        tokio::task::spawn(async move { while set.join_next().await.is_some() {} });
-        log::trace!("Dropped UseCounter");
-    }
 }
 
 pub(crate) struct Permit {
     is_active: bool,
-    value: WatchReceiver<u32>,
-    notifier: MpscSender<bool>,
+    value: Arc<WatchSender<u32>>,
 }
 
 impl Permit {
-    #[cfg(feature = "gstreamer")]
-    #[allow(dead_code)]
-    pub(crate) fn subscribe(&self) -> Self {
-        Self {
-            is_active: false,
-            value: self.value.clone(),
-            notifier: self.notifier.clone(),
-        }
-    }
-
     fn new(source: &UseCounter) -> Self {
         Self {
             is_active: false,
             value: source.value.clone(),
-            notifier: source.notifier_tx.clone(),
         }
     }
 
     pub(crate) async fn activate(&mut self) -> Result<()> {
-        if !self.is_active {
-            self.is_active = true;
-            self.notifier.send(self.is_active).await?;
-        }
+        self.set_active(true);
         Ok(())
     }
 
     pub(crate) async fn deactivate(&mut self) -> Result<()> {
-        if self.is_active {
-            self.is_active = false;
-            self.notifier.send(self.is_active).await?;
-        }
+        self.set_active(false);
         Ok(())
+    }
+
+    fn set_active(&mut self, active: bool) {
+        if self.is_active == active {
+            return;
+        }
+        self.is_active = active;
+        self.value.send_modify(|value| {
+            let old = *value;
+            *value = if active {
+                old.saturating_add(1)
+            } else {
+                old.saturating_sub(1)
+            };
+            log::trace!("Usecounter: {}->{}", old, *value);
+        });
     }
 
     pub(crate) async fn aquired_users(&self) -> Result<()> {
         self.value
-            .clone()
+            .subscribe()
             .wait_for(|curr| {
                 log::trace!("aquired_users: {}", *curr);
                 *curr > 0
@@ -136,7 +80,7 @@ impl Permit {
 
     pub(crate) async fn dropped_users(&self) -> Result<()> {
         self.value
-            .clone()
+            .subscribe()
             .wait_for(|curr| {
                 log::trace!("dropped_users: {}", *curr);
                 *curr == 0
@@ -147,21 +91,49 @@ impl Permit {
 
     #[cfg(feature = "gstreamer")]
     #[allow(dead_code)]
-    pub(crate) fn get_counter(&self) -> WatchReceiver<u32> {
-        self.value.clone()
+    pub(crate) fn get_counter(&self) -> tokio::sync::watch::Receiver<u32> {
+        self.value.subscribe()
     }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        if self.is_active {
-            self.is_active = false;
-            let _gt = tokio::runtime::Handle::current().enter();
-            let notifier = self.notifier.clone();
-            let is_active = self.is_active;
-            tokio::task::spawn(async move {
-                let _ = notifier.send(is_active).await;
-            });
-        }
+        self.set_active(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_count_follows_the_active_permits() -> Result<()> {
+        let counter = UseCounter::new().await;
+        let count = counter.value.subscribe();
+        let mut first = counter.create_activated().await?;
+        let second = counter.create_activated().await?;
+        assert_eq!(*count.borrow(), 2);
+
+        first.activate().await?;
+        assert_eq!(*count.borrow(), 2, "activating twice counts once");
+        first.deactivate().await?;
+        drop(first);
+        assert_eq!(*count.borrow(), 1, "an inactive permit releases nothing");
+        drop(second);
+        assert_eq!(*count.borrow(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_permit_dropped_without_a_runtime_is_still_released() -> Result<()> {
+        let counter = UseCounter::new().await;
+        let count = counter.value.subscribe();
+        let permit = counter.create_activated().await?;
+
+        // A plain thread has no tokio runtime: this used to panic there and
+        // leave the count at 1 for good
+        std::thread::spawn(move || drop(permit)).join().unwrap();
+        assert_eq!(*count.borrow(), 0);
+        Ok(())
     }
 }

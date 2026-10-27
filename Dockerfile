@@ -4,10 +4,14 @@
 #                    Miroslav Šedivý
 # SPDX-License-Identifier: AGPL-3.0-only
 
-FROM docker.io/rust:slim-bookworm AS build
+# The toolchain that rust-toolchain.toml pins
+FROM docker.io/rust:1.99.1-slim-trixie AS build
 ARG TARGETPLATFORM
 
 ENV DEBIAN_FRONTEND=noninteractive
+# As in CI's builds: jemalloc then also runs where memory pages are up to
+# 64k, as on some arm64 boards
+ENV JEMALLOC_SYS_WITH_LG_PAGE=16
 WORKDIR /usr/local/src/neolink
 COPY . /usr/local/src/neolink
 
@@ -45,8 +49,9 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
     cargo build --release; \
   fi
 
-# Create the release container. Match the base OS used to build
-FROM debian:bookworm-slim
+# Create the release container. Binaries built on bookworm, as CI's are,
+# run here too.
+FROM debian:trixie-slim
 ARG TARGETPLATFORM
 ARG REPO
 ARG VERSION
@@ -62,7 +67,7 @@ RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         openssl \
-        dnsutils \
+        bind9-dnsutils \
         iputils-ping \
         ca-certificates \
         libgstrtspserver-1.0-0 \
@@ -87,7 +92,12 @@ RUN gst-inspect-1.0; \
 
 ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554
 
-CMD /usr/local/bin/neolink "${NEO_LINK_MODE}" --config /etc/neolink.toml
+# Whether neolink still works: see `neolink healthcheck --help`
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD ["/usr/local/bin/neolink", "healthcheck"]
+
+# The entrypoint runs neolink in NEO_LINK_MODE unless given a command
+CMD []
 ENTRYPOINT ["/entrypoint.sh"]
 EXPOSE ${NEO_LINK_PORT}
 

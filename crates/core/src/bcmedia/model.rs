@@ -108,7 +108,7 @@ pub(super) const MAGIC_HEADER_BCMEDIA_IFRAME: u32 = 0x63643030;
 pub(super) const MAGIC_HEADER_BCMEDIA_IFRAME_LAST: u32 = 0x63643039;
 
 /// Video Types for I/PFrame
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoType {
     /// H264 video data
     H264,
@@ -279,16 +279,35 @@ pub struct BcMediaAdpcm {
 impl BcMediaAdpcm {
     /// The block size, this is bytes without the block header
     pub fn block_size(&self) -> u32 {
-        self.data.len() as u32 - 4
+        (self.data.len() as u32).saturating_sub(4)
     }
 
     /// Returns duration in micro seconds;
     pub fn duration(&self) -> Option<u32> {
-        let samples = self.block_size() * 2;
+        let samples = u64::from(self.block_size()) * 2;
         // Always 8000Hz for ADPCM
-        const SAMPLE_FREQUENCY: u32 = 8000;
-        const MICROSECONDS: u32 = 1000000;
-        let duration = samples * MICROSECONDS / SAMPLE_FREQUENCY;
-        Some(duration)
+        const SAMPLE_FREQUENCY: u64 = 8000;
+        const MICROSECONDS: u64 = 1000000;
+        // In u64: a block over 2 KiB took u32 past its maximum
+        u32::try_from(samples * MICROSECONDS / SAMPLE_FREQUENCY).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adpcm_sizes_neither_underflow_nor_overflow() {
+        let short = BcMediaAdpcm { data: vec![0; 2] };
+        assert_eq!(short.block_size(), 0);
+        assert_eq!(short.duration(), Some(0));
+
+        let large = BcMediaAdpcm {
+            data: vec![0; 60_004],
+        };
+        assert_eq!(large.block_size(), 60_000);
+        // 120000 samples at 8 kHz
+        assert_eq!(large.duration(), Some(15_000_000));
     }
 }

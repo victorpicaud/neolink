@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
 
 env:
-  rust_version: "1.82.0"
+  rust_version: "1.99.1"
 
 jobs:
   pre_job:
     # continue-on-error: true # Uncomment once integration is finished
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # Map a step output to a job output
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }} && ! (startsWith(github.ref, 'refs/tags/') && github.event_name == 'push')
@@ -28,25 +29,41 @@ jobs:
     if: needs.pre_job.outputs.should_skip != 'true'
     name: native
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-12, macos-14] # macos-14+ is arm64
+        os: [ubuntu-22.04, windows-2022, macos-15-intel, macos-14] # macos-15-intel is x86_64, macos-14 is arm64
     steps:
       - uses: actions/checkout@v4
         name: Checkout onto ${{ runner.os }}
       - if: runner.os == 'Linux'
         name: apt install linux deps
+        timeout-minutes: 15
         run: |
-          sudo apt update
-          sudo apt install -y aptitude
-          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
+          sudo apt -o Acquire::Retries=3 update
+          sudo apt -o Acquire::Retries=3 install -y aptitude
+          sudo aptitude install -y --without-recommends libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler libssl-dev
       - if: runner.os == 'Windows'
         name: Install Windows deps
+        timeout-minutes: 45
         run: |
-          # Gstreamer
-          choco install -y --no-progress gstreamer --version=1.24.2
-          choco install -y --no-progress gstreamer-devel --version=1.24.2
+          # Windows PowerShell's progress bar slows Invoke-WebRequest down
+          # dramatically on large downloads like these
+          $ProgressPreference = 'SilentlyContinue'
+          # Gstreamer, from its own site. The chocolatey package pinned an
+          # installer the site no longer has: it only keeps the last release of
+          # older series, so this pins the last 1.24 one.
+          $gst = "1.24.13"
+          foreach ($msi in @("gstreamer-1.0-msvc-x86_64-$gst.msi", "gstreamer-1.0-devel-msvc-x86_64-$gst.msi")) {
+            $path = Join-Path $PWD $msi
+            Invoke-WebRequest -Uri "https://gstreamer.freedesktop.org/data/pkg/windows/$gst/msvc/$msi" -OutFile $path
+            $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i", "`"$path`"", "/qn", "/norestart", "ADDLOCAL=ALL", "/l*v", "`"$path.log`""
+            if ($install.ExitCode -ne 0) {
+              Get-Content "$path.log" -Tail 40
+              throw "Installing $msi failed with $($install.ExitCode)"
+            }
+          }
           $env:GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:SYSTEMDRIVE + '\gstreamer\1.0\msvc_x86_64\'
           # Github runners work on both C or D drive and figuring out which was used is difficult
           if (-not (Test-Path -Path "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64" -PathType Container)) {
@@ -57,28 +74,45 @@ jobs:
           # Proto buffers
           choco install -y --no-progress protoc --version=24.2.0
 
-          # Open SSL
-          choco install -y --no-progress openssl --version=1.1.1.2100
-          $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL-Win64\'
-
-          # Alternative openssl location (depends on version that gets installed by choco)
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR=$env:SYSTEMDRIVE + '\Program Files\OpenSSL\'
+          # Open SSL, for the push notification client. The runner images come
+          # with it: installing it again meant a download from a site that
+          # stalled for the whole step timeout. Where it is depends on the
+          # installer and on which drive the runner uses.
+          $openssl = @(
+            "$env:SYSTEMDRIVE\Program Files\OpenSSL-Win64\",
+            "$env:SYSTEMDRIVE\Program Files\OpenSSL\",
+            'D:\Program Files\OpenSSL-Win64\',
+            'D:\Program Files\OpenSSL\'
+          )
+          $env:OPENSSL_DIR = $openssl | Where-Object { Test-Path (Join-Path $_ 'include\openssl\ssl.h') } | Select-Object -First 1
+          if (-not $env:OPENSSL_DIR) {
+            choco install -y --no-progress --execution-timeout=900 openssl
+            $env:OPENSSL_DIR = $openssl | Where-Object { Test-Path (Join-Path $_ 'include\openssl\ssl.h') } | Select-Object -First 1
           }
-          # Github runners work on both C or D drive and figuring out which was used is difficult
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR='D:\\Program Files\OpenSSL-Win64\'
+          if (-not $env:OPENSSL_DIR) {
+            throw "No OpenSSL with headers in any of $openssl"
           }
-          # Or course we could be on alternative location and drive....
-          if (-not (Test-Path -Path "$env:OPENSSL_DIR" -PathType Container)) {
-            $env:OPENSSL_DIR='D:\\Program Files\OpenSSL\'
+          # Recent installers keep the libraries apart by C runtime, and Rust
+          # links the dynamic one (MD)
+          $libs = Get-ChildItem -Path (Join-Path $env:OPENSSL_DIR 'lib') -Recurse -Filter 'libssl.lib' -ErrorAction SilentlyContinue
+          $lib = $libs | Where-Object { $_.DirectoryName -match '\\MD$' } | Select-Object -First 1
+          if (-not $lib) {
+            $lib = $libs | Select-Object -First 1
           }
+          if (-not $lib) {
+            throw "No libssl.lib under $env:OPENSSL_DIR"
+          }
+          $env:OPENSSL_LIB_DIR = $lib.DirectoryName
+          $env:OPENSSL_INCLUDE_DIR = Join-Path $env:OPENSSL_DIR 'include'
+          echo "OPENSSL_LIB_DIR=$env:OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR=$env:OPENSSL_INCLUDE_DIR"
 
           # Set github vars
           Add-Content -Path $env:GITHUB_ENV  -Value "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
           Add-Content -Path $env:GITHUB_PATH  -Value "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\bin"
           Add-Content -Path $env:GITHUB_PATH  -Value "%GSTREAMER_1_0_ROOT_MSVC_X86_64%\bin"
           Add-Content -Path $env:GITHUB_ENV  -Value "OPENSSL_DIR=$env:OPENSSL_DIR"
+          Add-Content -Path $env:GITHUB_ENV  -Value "OPENSSL_LIB_DIR=$env:OPENSSL_LIB_DIR"
+          Add-Content -Path $env:GITHUB_ENV  -Value "OPENSSL_INCLUDE_DIR=$env:OPENSSL_INCLUDE_DIR"
 
           # One last check on directories
           dir "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
@@ -86,16 +120,21 @@ jobs:
       - if: runner.os == 'macOS'
         name: Install macOS deps
         run: |
-          curl -L 'https://gstreamer.freedesktop.org/data/pkg/osx/1.20.4/gstreamer-1.0-devel-1.20.4-universal.pkg' -o "$(pwd)/gstreamer-devel.pkg"
-          sudo installer -verbose -pkg "$(pwd)/gstreamer-devel.pkg" -target /
+          # The site only keeps the last release of older series, so this pins
+          # the last 1.24 one. The libraries are in the runtime package.
+          gst=1.24.13
+          for pkg in "gstreamer-1.0-$gst-universal.pkg" "gstreamer-1.0-devel-$gst-universal.pkg"; do
+            curl -fsSL "https://gstreamer.freedesktop.org/data/pkg/osx/$gst/$pkg" -o "$(pwd)/$pkg"
+            sudo installer -pkg "$(pwd)/$pkg" -target /
+          done
           PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           PKG_CONFIG_GSTREAMER_1_0_PREFIX="/Library/Frameworks/GStreamer.framework/Versions/1.0"
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_GSTREAMER_1_0_PREFIX=${PKG_CONFIG_GSTREAMER_1_0_PREFIX}" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
-          brew install pkg-config protobuf openssl@1.1
-          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@1.1)/include/" >>  "${GITHUB_ENV}"
-          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@1.1)/lib/" >>  "${GITHUB_ENV}"
+          brew install pkg-config protobuf openssl@3
+          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@3)/include/" >>  "${GITHUB_ENV}"
+          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@3)/lib/" >>  "${GITHUB_ENV}"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -130,6 +169,7 @@ jobs:
     if: needs.pre_job.outputs.should_skip != 'true'
     name: cross
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     container: "node:current-bookworm-slim"
     strategy:
       fail-fast: false
@@ -158,11 +198,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install basic tools
+        timeout-minutes: 15
         run: |
           apt-get update
           apt-get install --assume-yes --no-install-recommends curl ca-certificates protobuf-compiler
       - name: Install ${{ matrix.arch }} cross compiler and gstreamer
         id: setup
+        timeout-minutes: 15
         run: |
           dpkg --add-architecture ${{ matrix.arch }}
           apt-get update
@@ -203,6 +245,7 @@ jobs:
     name: Build Docker image
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs:
       - "cross"
     steps:
@@ -211,7 +254,7 @@ jobs:
         shell: bash
         run: |
           unset HAS_SECRET
-          if [ -n $SECRET ]; then HAS_SECRET='true' ; fi
+          if [ -n "$SECRET" ]; then HAS_SECRET='true' ; fi
           echo "HAS_SECRET_TOKEN=${HAS_SECRET}" >> $GITHUB_OUTPUT
         env:
           SECRET: "${{ secrets.DOCKER_TOKEN }}"
@@ -287,38 +330,46 @@ jobs:
         env:
           REPO_NAME: ${{ steps.docker_repo.outputs.DOCKER_NWO }}
       - name: Install rust
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
         run: |
           rustup default "${{ env.rust_version }}"
           rustup toolchain install stable
       - name: Install toml-cli
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
         run: |
           cargo install toml-cli
       - name: Get project version
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
         id: toml
         run: |
           NEOLINK_VERSION="$(toml get Cargo.toml  package.version | sed 's|"||g')"
           echo "version=${NEOLINK_VERSION}"  >> $GITHUB_OUTPUT
       - name: Prepare directory
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
         run: |
           mkdir linux
           mkdir linux/arm
           mkdir linux/arm64
       - name: Download Linux x86_64
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
         uses: actions/download-artifact@v4
         with:
           name: release-amd64-bookworm
           path: linux/amd64
       - name: Download Linux armv7
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
         uses: actions/download-artifact@v4
         with:
           name: release-armhf-bookworm
           path: linux/arm/v7
       - name: Download Linux arm64
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
         uses: actions/download-artifact@v4
         with:
           name: release-arm64-bookworm
           path: linux/arm64
       - name: Download Linux i386
+        if: ${{ steps.vars.outputs.HAS_SECRET_TOKEN }}
         uses: actions/download-artifact@v4
         with:
           name: release-i386-bookworm
@@ -339,6 +390,7 @@ jobs:
   create_release:
     name: Create Release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/') && github.event_name == 'push' # Ensure this only runs on a tag or expect issues
     needs:
       - "cross"
@@ -366,7 +418,7 @@ jobs:
       - name: Download Macos
         uses: actions/download-artifact@v4
         with:
-          name: release-macos-12
+          name: release-macos-15-intel
           path: neolink_macos_intel
       - name: Download Macos arm64
         uses: actions/download-artifact@v4
@@ -415,7 +467,7 @@ jobs:
             zip -r "${d}.zip" "${d}"
           done
       - name: release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: Neolink ${{steps.toml.outputs.version}}
           files: |

@@ -60,13 +60,16 @@
 //! `credentials` are the username and password required to identify with the mqtt server
 //!
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, PoisonError},
+};
 use tokio::{
     sync::mpsc::channel as mpsc,
     task::JoinSet,
-    time::{interval, sleep, Duration, MissedTickBehavior},
+    time::{interval, sleep, timeout, Duration, MissedTickBehavior},
 };
-use tokio_stream::{wrappers::IntervalStream, StreamExt};
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use validator::Validate;
 
@@ -77,7 +80,7 @@ mod discovery;
 mod mqttc;
 
 use crate::{
-    common::{MdState, NeoInstance, NeoReactor},
+    common::{supervise_cameras, MdState, NeoInstance, NeoReactor},
     config::Config,
     AnyResult,
 };
@@ -85,6 +88,7 @@ use anyhow::{anyhow, Context, Result};
 pub(crate) use cmdline::Opt;
 pub(crate) use discovery::Discoveries;
 use log::*;
+pub(crate) use mqttc::set_client_id;
 use mqttc::{Mqtt, MqttReplyRef};
 
 use self::{
@@ -94,89 +98,52 @@ use self::{
 
 /// Entry point for the mqtt subcommand
 ///
-/// Opt is the command line options
-pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
+/// Opt is the command line options. It runs until `stop` is cancelled, or
+/// fails.
+pub(crate) async fn main(_: Opt, reactor: NeoReactor, stop: CancellationToken) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
     let global_cancel = CancellationToken::new();
     let cancel_drop = global_cancel.clone().drop_guard();
     let config = reactor.config().await?;
+    if config.borrow().mqtt.is_none() {
+        // Without it nothing would ever answer, and neolink would just hang
+        return Err(anyhow!("MQTT needs an [mqtt] section in the config"));
+    }
     let mqtt = Mqtt::new(config.clone()).await;
 
-    // Startup and stop cameras as they are added/removed to the config
-    let thread_cancel = global_cancel.clone();
-    let mut thread_config = config.clone();
+    // Start and stop each camera's MQTT handler as cameras are enabled and
+    // disabled, and restart them if they fail
     let thread_reactor = reactor.clone();
-    let thread_instance = mqtt.subscribe("").await?;
-    set.spawn(async move {
-        let mut set = JoinSet::<AnyResult<()>>::new();
-        let thread_cancel2 = thread_cancel.clone();
-        tokio::select!{
-            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-            v = async {
-                let mut cameras: HashMap<String, CancellationToken> = Default::default();
-                let mut config_names = HashSet::new();
-                loop {
-                    thread_config.wait_for(|config| {
-                        let current_names = config.cameras.iter().filter(|a| a.enabled).map(|cam_config| cam_config.name.clone()).collect::<HashSet<_>>();
-                        current_names != config_names
-                    }).await.with_context(|| "Camera Config Watcher")?;
-                    config_names = thread_config.borrow().clone().cameras.iter().filter(|a| a.enabled).map(|cam_config| cam_config.name.clone()).collect::<HashSet<_>>();
-
-                    for name in config_names.iter() {
-                        log::info!("{name}: MQTT Starting");
-                        if ! cameras.contains_key(name) {
-                            let local_cancel = CancellationToken::new();
-                            cameras.insert(name.clone(),local_cancel.clone());
-
-                            let thread_global_cancel = thread_cancel2.clone();
-                            let thread_reactor2 = thread_reactor.clone();
-                            let mqtt_instance = thread_instance.subscribe(name).await?;
-                            let name = name.clone();
-                            set.spawn(async move {
-                                loop {
-                                    let camera = thread_reactor2.get(&name).await?;
-                                    let mqtt_instance = mqtt_instance.resubscribe().await?;
-                                    let r = tokio::select!{
-                                        _ = thread_global_cancel.cancelled() => {
-                                            AnyResult::Ok(())
-                                        },
-                                        _ = local_cancel.cancelled() => {
-                                            AnyResult::Ok(())
-                                        },
-                                        v = listen_on_camera(camera, mqtt_instance) => {
-                                            v
-                                        },
-                                    };
-                                    if let Ok(()) = &r {
-                                        break r
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                            }) ;
-                        }
-                    }
-
-                    for (running_name, token) in cameras.iter() {
-                        if ! config_names.contains(running_name) {
-                            token.cancel();
-                        }
-                    }
-                }
-            } => v,
-        }
-    });
+    let thread_instance = Arc::new(mqtt.subscribe("").await?);
+    set.spawn(supervise_cameras(
+        "MQTT",
+        config.clone(),
+        global_cancel.clone(),
+        move |name| {
+            let reactor = thread_reactor.clone();
+            let instance = thread_instance.clone();
+            async move {
+                let camera = reactor.get(&name).await?;
+                let mqtt_instance = instance.subscribe(name).await?;
+                listen_on_camera(camera, mqtt_instance).await
+            }
+        },
+        |_: &str| {},
+    ));
 
     // This threads prints the config
+    let own_configs = Arc::new(OwnConfigs::default());
     let mut thread_config = config.clone();
     let thread_instance = mqtt.subscribe("").await?;
     let thread_cancel = global_cancel.clone();
+    let thread_own_configs = own_configs.clone();
     set.spawn(async move {
         tokio::select! {
             _ = thread_cancel.cancelled() => AnyResult::Ok(()),
             v = async {
                 let mut curr_config = thread_config.borrow().clone();
                 let str = toml::to_string(&curr_config)?;
+                thread_own_configs.published(&str);
                 thread_instance.send_message("config", &str, true).await?;
                 loop {
                     curr_config = thread_config
@@ -184,6 +151,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                         .await?
                         .clone();
                     let str = toml::to_string(&curr_config)?;
+                    thread_own_configs.published(&str);
                     thread_instance.send_message("config", &str, true).await?;
                     log::trace!("UpdatedPosted config");
                 }
@@ -202,6 +170,16 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
             v = async {
                 while let Ok(msg) = thread_instance.recv().await {
                     if msg.topic == "config" {
+                        if own_configs.came_back(&msg.message) {
+                            continue;
+                        }
+                        // Not one the broker kept from before neolink
+                        // connected, such as neolink's own from its last run:
+                        // that could undo the config file
+                        if msg.retain {
+                            log::debug!("Ignoring the config the broker kept on neolink/config");
+                            continue;
+                        }
                         let config: Result<Config> = toml::from_str(&msg.message).with_context(|| {
                             format!("Failed to parse the MQTT {:?} config file", msg.topic)
                         });
@@ -214,37 +192,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                         let curr_config = thread_config.borrow().clone();
                         let mut config = config?;
 
-                        // Fill in skipped passwords
-                        if let (Some(mqtt), Some(curr_mqtt)) = (config.mqtt.as_mut(), curr_config.mqtt.as_ref()) {
-                            if mqtt.credentials.is_none() {
-                                mqtt.credentials = curr_mqtt.credentials.clone();
-                            }
-                            if mqtt.ca.is_none() {
-                                mqtt.ca = curr_mqtt.ca.clone();
-                            }
-                            if mqtt.client_auth.is_none() {
-                                mqtt.client_auth = curr_mqtt.client_auth.clone();
-                            }
-                        }
-                        for cam in config.cameras.iter_mut() {
-                            let name = cam.name.clone();
-                            let cur_cam = curr_config.cameras.iter().find(|c| c.name == name);
-                            if let Some(cur_cam) = cur_cam.as_ref() {
-                                if cam.password.is_none() {
-                                    cam.password = cur_cam.password.clone();
-                                }
-                            }
-                        }
-                        for user in config.users.iter_mut() {
-                            let name = user.name.clone();
-                            let cur_user = curr_config.users.iter().find(|c| c.name == name);
-                            if let Some(cur_user) = cur_user.as_ref() {
-                                if user.pass.is_none() {
-                                    user.pass = cur_user.pass.clone();
-                                }
-                            }
-                        }
-                        // Passwords should now be restored if they were not set
+                        fill_in_passwords(&mut config, &curr_config);
 
                         let validate = config.validate().with_context(|| {
                             format!("Failed to validate the MQTT {:?} config file", msg.topic)
@@ -272,15 +220,98 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
         }
     });
 
-    while let Some(result) = set.join_next().await {
-        if let Err(_) | Ok(Err(_)) = &result {
-            global_cancel.cancel();
-            result??;
+    // None of these tasks ends on its own, so whichever ends first stops the
+    // others, and neolink exits with its error. Being asked to stop is no
+    // error.
+    let first = tokio::select! {
+        _ = stop.cancelled() => None,
+        ended = set.join_next() => Some(match ended {
+            Some(Ok(ended)) => ended,
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(()),
+        }),
+    };
+    global_cancel.cancel();
+    let stopping = async { while set.join_next().await.is_some() {} };
+    if timeout(Duration::from_secs(5), stopping).await.is_err() {
+        warn!("MQTT took over 5s to stop");
+    }
+    drop(cancel_drop);
+    // Offline and gone from the broker before neolink exits: dropping the
+    // client left that to a task that exiting cut short
+    mqtt.shutdown().await;
+    match first {
+        None => Ok(()),
+        Some(first) => Err(first.err().unwrap_or_else(|| anyhow!("MQTT stopped"))),
+    }
+}
+
+/// The configs neolink published on neolink/config that have not come back
+/// yet. Listening there, neolink hears its own as well, and took them for new
+/// ones: with two configs on their way, each one undid the other, endlessly.
+#[derive(Default)]
+struct OwnConfigs(Mutex<VecDeque<String>>);
+
+impl OwnConfigs {
+    /// How many are remembered, for those that never come back
+    const KEPT: usize = 16;
+
+    fn published(&self, config: &str) {
+        let mut configs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if configs.len() == Self::KEPT {
+            configs.pop_front();
         }
+        configs.push_back(config.to_string());
     }
 
-    drop(cancel_drop);
-    Ok(())
+    /// Whether `config` is one of neolink's own, coming back. They come back
+    /// in the order they were published, so those before it never will.
+    fn came_back(&self, config: &str) -> bool {
+        let mut configs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match configs.iter().position(|own| own == config) {
+            Some(i) => {
+                configs.drain(..=i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Fills in the passwords that a config sent over MQTT leaves out, from the
+/// current config, but only for where they were meant for: whoever can
+/// publish a config could otherwise point a camera, or the broker, at a host
+/// of theirs, and have the password sent there. The CA and client certificate
+/// hold no secret, and the CA keeps a broker elsewhere on TLS.
+fn fill_in_passwords(config: &mut Config, current: &Config) {
+    if let (Some(mqtt), Some(curr_mqtt)) = (config.mqtt.as_mut(), current.mqtt.as_ref()) {
+        let same_broker = mqtt.broker_addr == curr_mqtt.broker_addr && mqtt.port == curr_mqtt.port;
+        if mqtt.credentials.is_none() && same_broker {
+            mqtt.credentials = curr_mqtt.credentials.clone();
+        }
+        if mqtt.ca.is_none() {
+            mqtt.ca = curr_mqtt.ca.clone();
+        }
+        if mqtt.client_auth.is_none() {
+            mqtt.client_auth = curr_mqtt.client_auth.clone();
+        }
+    }
+    for cam in config.cameras.iter_mut() {
+        if let Some(curr_cam) = current.cameras.iter().find(|c| c.name == cam.name) {
+            let same_camera =
+                cam.camera_addr == curr_cam.camera_addr && cam.camera_uid == curr_cam.camera_uid;
+            if cam.password.is_none() && same_camera {
+                cam.password = curr_cam.password.clone();
+            }
+        }
+    }
+    for user in config.users.iter_mut() {
+        if let Some(curr_user) = current.users.iter().find(|u| u.name == user.name) {
+            if user.pass.is_none() {
+                user.pass = curr_user.pass.clone();
+            }
+        }
+    }
 }
 
 async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> Result<()> {
@@ -370,6 +401,9 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                             } => v,
                                         }
                                     });
+                                    // Let go of the handlers that finished, or
+                                    // their results pile up for every message
+                                    while set_msg.try_join_next().is_some() {}
                                 }
                                 AnyResult::Ok(())
                             } => {
@@ -460,7 +494,8 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                 mqtt_motion.send_message("status/motion", "on", true).await.with_context(|| {
                                     format!("{}: Failed to publish motion start", camera_name)
                                 })?;
-                                md.wait_for(|state| matches!(state, MdState::Stop(_))).await.with_context(|| {
+                                // Unknown too: the camera went away
+                                md.wait_for(|state| !matches!(state, MdState::Start(_))).await.with_context(|| {
                                     format!("{}: MdStop Watch Dropped", camera_name)
                                 })?;
                                 mqtt_motion.send_message("status/motion", "off", true).await.with_context(|| {
@@ -478,90 +513,65 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     }, if config.enable_motion => v,
                     // Handle the SNAP (image preview)
                     v = async {
-                        let mut wait = IntervalStream::new({
-                            let mut i = interval(Duration::from_millis(config.preview_update));
-                            i.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                            i
-                        });
-                        let v = async {
-                            while wait.next().await.is_some() {
-                                let image = camera_snap.run_passive_task(|cam| {
-                                    Box::pin(async move {
-                                        let image = cam.get_snapshot().await?;
-                                        AnyResult::Ok(image)
-                                    })
-                                }).await;
-                                let image = match image {
-                                    Err(e) => match e.downcast::<neolink_core::Error>() {
-                                        Ok(neolink_core::Error::CameraServiceUnavailable{..}) => {
-                                            log::debug!("Image not supported");
-                                            futures::future::pending().await
-                                        },
-                                        Ok(e) => Err(e.into()),
-                                        Err(e) => Err(e),
-                                    }
-                                    n => n,
-                                }?;
-                                mqtt_snap
+                        let mut wait = interval(Duration::from_millis(config.preview_update));
+                        wait.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                        let mut failing = false;
+                        loop {
+                            wait.tick().await;
+                            let image = camera_snap.run_passive_task(|cam| {
+                                Box::pin(async move {
+                                    let image = cam.get_snapshot().await?;
+                                    AnyResult::Ok(image)
+                                })
+                            }).await;
+                            match image {
+                                Ok(image) => {
+                                    failing = false;
+                                    mqtt_snap
                                         .send_message("status/preview", BASE64.encode(image).as_str(), true)
                                         .await
                                         .with_context(|| {
                                             format!("{}: Failed to publish preview", camera_name)
                                         })?;
+                                }
+                                Err(e) if is_unsupported(&e) => {
+                                    log::debug!("{camera_name}: Image not supported: {e:#}");
+                                    futures::future::pending::<()>().await;
+                                }
+                                Err(e) => skipped_tick(&mut failing, &camera_name, "preview", &e),
                             }
-                            AnyResult::Ok(())
-                        }.await;
-                        match v.map_err(|e| e.downcast::<neolink_core::Error>()) {
-                            Err(Ok(neolink_core::Error::UnintelligibleReply{..})) => futures::future::pending().await,
-                            Ok(()) => AnyResult::Ok(()),
-                            Err(Ok(e)) => Err(e.into()),
-                            Err(Err(e)) => Err(e),
-                        }?;
-                        AnyResult::Ok(())
+                        }
                     }, if config.enable_preview => v,
                     // Handle the battery publish
                     v = async {
-                        let mut wait = IntervalStream::new({
-                            let mut i = interval(Duration::from_millis(config.battery_update));
-                            i.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                            i
-                        });
-
-                        let v = async {
-                            while wait.next().await.is_some() {
-                                let xml = camera_battery.run_passive_task(|cam| {
-                                    Box::pin(async move {
-                                        let xml = cam.battery_info().await?;
-                                        AnyResult::Ok(xml)
-                                    })
-                                }).await;
-                                let xml = match xml {
-                                    Err(e) => match e.downcast::<neolink_core::Error>() {
-                                        Ok(neolink_core::Error::CameraServiceUnavailable{..}) => {
-                                            log::debug!("Battery not supported");
-                                            futures::future::pending().await
-                                        },
-                                        Ok(e) => Err(e.into()),
-                                        Err(e) => Err(e),
-                                    }
-                                    n => n,
-                                }?;
-                                mqtt_battery
+                        let mut wait = interval(Duration::from_millis(config.battery_update));
+                        wait.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                        let mut failing = false;
+                        loop {
+                            wait.tick().await;
+                            let xml = camera_battery.run_passive_task(|cam| {
+                                Box::pin(async move {
+                                    let xml = cam.battery_info().await?;
+                                    AnyResult::Ok(xml)
+                                })
+                            }).await;
+                            match xml {
+                                Ok(xml) => {
+                                    failing = false;
+                                    mqtt_battery
                                         .send_message("status/battery_level", format!("{}", xml.battery_percent).as_str(), true)
                                         .await
                                         .with_context(|| {
                                             format!("{}: Failed to publish battery", camera_name)
                                         })?;
+                                }
+                                Err(e) if is_unsupported(&e) => {
+                                    log::debug!("{camera_name}: Battery not supported: {e:#}");
+                                    futures::future::pending::<()>().await;
+                                }
+                                Err(e) => skipped_tick(&mut failing, &camera_name, "battery level", &e),
                             }
-                            AnyResult::Ok(())
-                        }.await;
-                        match v.map_err(|e| e.downcast::<neolink_core::Error>()) {
-                            Err(Ok(neolink_core::Error::UnintelligibleReply{..})) => futures::future::pending().await,
-                            Ok(()) => AnyResult::Ok(()),
-                            Err(Ok(e)) => Err(e.into()),
-                            Err(Err(e)) => Err(e),
-                        }?;
-                        AnyResult::Ok(())
+                        }
                     }, if config.enable_battery => v,
                     // Handle the push notification messages
                     v = async {
@@ -593,42 +603,31 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     }, if cfg!(feature = "pushnoti") => v,
                     // Handle the floodlight task activation
                     v = async {
-                        let flt_status = camera_floodlight_tasks.run_passive_task(|cam| Box::pin(async move {
-                            Ok(cam.is_flightlight_tasks_enabled().await?)
-                        })).await;
-                        if flt_status.is_err() {
-                            // Assume floodlight unsupported
-                            futures::future::pending::<()>().await;
-                        }
-                        let flt_status = flt_status.unwrap();
-                        let flt_status_txt = match flt_status {
-                            true => "on".to_string(),
-                            false => "off".to_string(),
-                        };
-                        mqtt_floodlight_tasks.send_message("status/floodlight_tasks", &flt_status_txt, true).await.with_context(|| {
-                            format!("{}: Failed to publish floodlight task notification", camera_name)
-                        })?;
-
-                        let mut wait = IntervalStream::new({
-                            let mut i = interval(Duration::from_millis(config.floodlight_update));
-                            i.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                            i
-                        });
-                        while wait.next().await.is_some() {
+                        let mut wait = interval(Duration::from_millis(config.floodlight_update));
+                        wait.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                        let mut failing = false;
+                        loop {
+                            wait.tick().await;
                             let flt_status = camera_floodlight_tasks.run_passive_task(|cam| Box::pin(async move {
                                 Ok(cam.is_flightlight_tasks_enabled().await?)
                             })).await;
-                            if let Ok(flt_status) = flt_status {
-                                let flt_status_txt = match flt_status {
-                                    true => "on".to_string(),
-                                    false => "off".to_string(),
-                                };
-                                mqtt_floodlight_tasks.send_message("status/floodlight_tasks", &flt_status_txt, true).await.with_context(|| {
-                                    format!("{}: Failed to publish floodlight task notification", camera_name)
-                                })?;
+                            match flt_status {
+                                Ok(flt_status) => {
+                                    failing = false;
+                                    let flt_status_txt = if flt_status { "on" } else { "off" };
+                                    mqtt_floodlight_tasks.send_message("status/floodlight_tasks", flt_status_txt, true).await.with_context(|| {
+                                        format!("{}: Failed to publish floodlight task notification", camera_name)
+                                    })?;
+                                }
+                                Err(e) if is_unsupported(&e) => {
+                                    log::debug!("{camera_name}: Floodlight tasks not supported: {e:#}");
+                                    futures::future::pending::<()>().await;
+                                }
+                                // Tried again at the next tick: one failed
+                                // query used to stop these updates for good
+                                Err(e) => skipped_tick(&mut failing, &camera_name, "floodlight tasks", &e),
                             }
                         }
-                        AnyResult::Ok(())
                     }, if config.enable_floodlight => v,
                 }?;
                 AnyResult::Ok(())
@@ -639,6 +638,27 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
     drop(drop_cancel);
     r?;
     Ok(())
+}
+
+/// Whether the camera does not support a request, or answers it in a way that
+/// cannot be understood: asking again would not help
+fn is_unsupported(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<neolink_core::Error>(),
+        Some(neolink_core::Error::CameraServiceUnavailable { .. })
+            | Some(neolink_core::Error::UnintelligibleReply { .. })
+    )
+}
+
+/// Logs a periodic update that failed and is tried again at the next tick: as
+/// a warning when it starts failing, then at debug for as long as it fails
+fn skipped_tick(failing: &mut bool, camera_name: &str, what: &str, e: &anyhow::Error) {
+    if *failing {
+        log::debug!("{camera_name}: Could not update the {what}: {e:#}");
+    } else {
+        log::warn!("{camera_name}: Could not update the {what}, will keep trying: {e:#}");
+        *failing = true;
+    }
 }
 
 async fn handle_mqtt_message(
@@ -1072,7 +1092,7 @@ async fn handle_mqtt_message(
             message,
         } => {
             let reply = match message.parse::<u64>() {
-                Ok(secs) => {
+                Ok(minutes) => {
                     if let Ok(permit) = camera.permit().await {
                         // This task waits for the `run_task` to send the OK then starts the countdown
                         // to drop the permit
@@ -1084,7 +1104,9 @@ async fn handle_mqtt_message(
                                 .run_task(|_cam| Box::pin(async move { AnyResult::Ok(()) }))
                                 .await;
 
-                            sleep(Duration::from_secs(secs * 60)).await;
+                            // At most a day: more overflowed, or kept a
+                            // battery camera awake for good
+                            sleep(Duration::from_secs(minutes.min(24 * 60) * 60)).await;
 
                             drop(permit);
                         });
@@ -1341,4 +1363,97 @@ async fn handle_mqtt_message(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_refusal_counts_as_unsupported() {
+        let refused = anyhow::Error::from(neolink_core::Error::CameraServiceUnavailable {
+            id: 109,
+            code: 400,
+        });
+        assert!(is_unsupported(&refused));
+        assert!(is_unsupported(&refused.context("while taking a snapshot")));
+        assert!(!is_unsupported(&anyhow!("timed out")));
+        assert!(!is_unsupported(&anyhow::Error::from(
+            neolink_core::Error::DroppedConnection
+        )));
+    }
+
+    #[test]
+    fn neolink_knows_its_own_configs_when_they_come_back() {
+        let own = OwnConfigs::default();
+        own.published("a");
+        own.published("b");
+        assert!(!own.came_back("c"), "someone else's");
+        assert!(own.came_back("a"));
+        assert!(!own.came_back("a"), "the same again, from someone else");
+        assert!(own.came_back("b"));
+
+        own.published("d");
+        own.published("e");
+        assert!(own.came_back("e"));
+        assert!(!own.came_back("d"), "lost, since it did not come first");
+    }
+
+    #[test]
+    fn a_password_left_out_is_filled_in_only_for_where_it_was_meant_for() {
+        let config = |toml: &str| -> Config { toml::from_str(toml).unwrap() };
+        let current = config(
+            r#"
+            [mqtt]
+            broker_addr = "broker"
+            port = 1883
+            credentials = ["user", "secret"]
+
+            [[cameras]]
+            name = "same"
+            username = "admin"
+            address = "10.0.0.1:9000"
+            password = "secret"
+
+            [[cameras]]
+            name = "moved"
+            username = "admin"
+            address = "10.0.0.2:9000"
+            password = "secret"
+            "#,
+        );
+        // A config sent over MQTT, without the passwords
+        let from_mqtt = |broker: &str| {
+            let mut config = config(&format!(
+                r#"
+                [mqtt]
+                broker_addr = "{broker}"
+                port = 1883
+
+                [[cameras]]
+                name = "same"
+                username = "admin"
+                address = "10.0.0.1:9000"
+
+                [[cameras]]
+                name = "moved"
+                username = "admin"
+                address = "10.0.0.66:9000"
+                "#
+            ));
+            fill_in_passwords(&mut config, &current);
+            config
+        };
+
+        let same_broker = from_mqtt("broker");
+        assert_eq!(same_broker.cameras[0].password.as_deref(), Some("secret"));
+        assert_eq!(
+            same_broker.cameras[1].password, None,
+            "a camera moved elsewhere"
+        );
+        assert!(same_broker.mqtt.unwrap().credentials.is_some());
+
+        let broker_elsewhere = from_mqtt("elsewhere");
+        assert_eq!(broker_elsewhere.mqtt.unwrap().credentials, None);
+    }
 }

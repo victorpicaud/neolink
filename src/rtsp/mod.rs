@@ -56,15 +56,13 @@ use anyhow::{anyhow, Context, Result};
 use gstreamer_rtsp_server::prelude::*;
 use log::*;
 use neolink_core::bc_protocol::StreamKind;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::{
-    sync::watch::channel as watch,
+    sync::watch::{channel as watch, Sender as WatchSender},
     task::JoinSet,
-    time::{interval, Duration},
+    time::{sleep, timeout, Duration},
 };
-use tokio_stream::wrappers::IntervalStream;
-use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 mod cmdline;
@@ -72,7 +70,7 @@ mod factory;
 mod gst;
 mod stream;
 
-use crate::common::{NeoInstance, NeoReactor};
+use crate::common::{supervise_cameras, Backoff, NeoInstance, NeoReactor};
 use factory::*;
 use stream::*;
 
@@ -82,10 +80,16 @@ use gst::NeoRtspServer;
 
 type AnyResult<T> = anyhow::Result<T, anyhow::Error>;
 
+/// How often the streams a camera offers are checked again, besides whenever
+/// it connects. They only change with its settings, and a battery camera
+/// should be left to sleep.
+const STREAM_INFO_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// Entry point for the rtsp subcommand
 ///
-/// Opt is the command line options
-pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
+/// Opt is the command line options. It serves until `stop` is cancelled, or
+/// fails.
+pub(crate) async fn main(_opt: Opt, reactor: NeoReactor, stop: CancellationToken) -> Result<()> {
     let rtsp = Arc::new(NeoRtspServer::new()?);
 
     let global_cancel = CancellationToken::new();
@@ -128,7 +132,7 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
 
                     let config = thread_config.borrow().clone();
                     if let Err(e) = apply_users(&thread_rtsp, &curr_users).await {
-                        log::error!("Could not setup TLS: {e}");
+                        log::error!("Could not set up the users: {e}");
                     }
 
                     if config.certificate.is_none() && !curr_users.is_empty() {
@@ -141,91 +145,58 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
         }
     });
 
-    // Startup and stop cameras as they are added/removed to the config
-    let mut thread_config = reactor.config().await?;
-    let thread_cancel = global_cancel.clone();
-    let thread_rtsp = rtsp.clone();
+    // Start and stop each camera's streams as cameras are enabled and
+    // disabled, and restart them if they fail
     let thread_reactor = reactor.clone();
-    set.spawn(async move {
-        let mut set = JoinSet::<AnyResult<()>>::new();
-        let thread_cancel2 = thread_cancel.clone();
-        tokio::select!{
-            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-            v = async {
-                let mut cameras: HashMap<String, CancellationToken> = Default::default();
-                let mut config_names = HashSet::new();
-                loop {
-                    config_names = thread_config.wait_for(|config| {
-                        let current_names = config.cameras.iter().filter(|a| a.enabled).map(|cam_config| cam_config.name.clone()).collect::<HashSet<_>>();
-                        current_names != config_names
-                    }).await.with_context(|| "Camera Config Watcher")?.clone().cameras.iter().filter(|a| a.enabled).map(|cam_config| cam_config.name.clone()).collect::<HashSet<_>>();
-
-                    for name in config_names.iter() {
-                        if ! cameras.contains_key(name) {
-                            log::info!("{name}: Rtsp Starting");
-                            let local_cancel = CancellationToken::new();
-                            cameras.insert(name.clone(),local_cancel.clone() );
-                            let thread_global_cancel = thread_cancel2.clone();
-                            let thread_rtsp2 = thread_rtsp.clone();
-                            let thread_reactor2 = thread_reactor.clone();
-                            let name = name.clone();
-                            set.spawn(async move {
-                                let camera = thread_reactor2.get(&name).await?;
-                                tokio::select!(
-                                    _ = thread_global_cancel.cancelled() => {
-                                        AnyResult::Ok(())
-                                    },
-                                    _ = local_cancel.cancelled() => {
-                                        AnyResult::Ok(())
-                                    },
-                                    v = camera_main(camera, &thread_rtsp2) => v,
-                                )
-                            }) ;
-                        }
-                    }
-
-                    for (running_name, token) in cameras.iter() {
-                        if ! config_names.contains(running_name) {
-                            token.cancel();
-                        }
-                    }
-                }
-            } => v,
-        }
-    });
+    let thread_rtsp = rtsp.clone();
+    let unmount_rtsp = rtsp.clone();
+    set.spawn(supervise_cameras(
+        "RTSP",
+        reactor.config().await?,
+        global_cancel.clone(),
+        move |name| {
+            let reactor = thread_reactor.clone();
+            let rtsp = thread_rtsp.clone();
+            async move { camera_main(reactor.get(&name).await?, &rtsp).await }
+        },
+        move |name: &str| unmount_camera(&unmount_rtsp, name),
+    ));
 
     let rtsp_config = reactor.config().await?.borrow().clone();
     info!(
         "Starting RTSP Server at {}:{}",
-        &rtsp_config.bind_addr, rtsp_config.bind_port,
+        rtsp_config.bind_addr, rtsp_config.bind_port,
     );
 
     let bind_addr = rtsp_config.bind_addr.clone();
     let bind_port = rtsp_config.bind_port;
-    rtsp.run(&bind_addr, bind_port).await?;
+    let _running = rtsp.run(&bind_addr, bind_port).await?;
     let thread_rtsp = rtsp.clone();
     set.spawn(async move { thread_rtsp.join().await });
 
-    while let Some(joined) = set
-        .join_next()
-        .await
-        .map(|s| s.map_err(anyhow::Error::from))
-    {
-        match &joined {
-            Err(e) | Ok(Err(e)) => {
-                // Panicked or error in task
-                // Cancel all and await terminate
-                log::error!("Error: {e}");
-                global_cancel.cancel();
-                rtsp.quit().await?;
-            }
-            Ok(Ok(_)) => {
-                // All good
-            }
-        }
+    // None of these tasks ends on its own, so whichever ends first stops the
+    // others, and neolink exits with its error. Being asked to stop is no
+    // error.
+    let first = tokio::select! {
+        _ = stop.cancelled() => None,
+        ended = set.join_next() => Some(match ended {
+            Some(Ok(ended)) => ended,
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(()),
+        }),
+    };
+    global_cancel.cancel();
+    rtsp.quit();
+    let stopping = async { while set.join_next().await.is_some() {} };
+    if timeout(Duration::from_secs(5), stopping).await.is_err() {
+        warn!("The RTSP server took over 5s to stop");
     }
-
-    Ok(())
+    match first {
+        None => Ok(()),
+        Some(first) => Err(first
+            .err()
+            .unwrap_or_else(|| anyhow!("The RTSP server stopped"))),
+    }
 }
 
 /// This keeps the users in rtsp and the config in sync
@@ -253,42 +224,10 @@ async fn apply_users(rtsp: &NeoRtspServer, curr_users: &HashSet<UserConfig>) -> 
 async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
     let name = camera.config().await?.borrow().name.clone();
     log::debug!("{name}: Camera Main");
-    let later_camera = camera.clone();
     let (supported_streams_tx, supported_streams) = watch(HashSet::<StreamKind>::new());
 
     let mut set = JoinSet::new();
-    set.spawn(async move {
-        let mut i = IntervalStream::new(interval(Duration::from_secs(15)));
-        while i.next().await.is_some() {
-            let stream_info = later_camera
-                .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_stream_info().await?) }))
-                .await?;
-
-            let new_supported_streams = stream_info
-                .stream_infos
-                .iter()
-                .flat_map(|stream_info| stream_info.encode_tables.clone())
-                .flat_map(|encode| match encode.name.as_str() {
-                    "mainStream" => Some(StreamKind::Main),
-                    "subStream" => Some(StreamKind::Sub),
-                    "externStream" => Some(StreamKind::Extern),
-                    new_stream_name => {
-                        log::debug!("New stream name {}", new_stream_name);
-                        None
-                    }
-                })
-                .collect::<HashSet<_>>();
-            supported_streams_tx.send_if_modified(|old| {
-                if *old != new_supported_streams {
-                    *old = new_supported_streams;
-                    true
-                } else {
-                    false
-                }
-            });
-        }
-        AnyResult::Ok(())
-    });
+    set.spawn(poll_supported_streams(camera.clone(), supported_streams_tx));
 
     let mut camera_config = camera.config().await?.clone();
     loop {
@@ -329,22 +268,14 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                 };
 
                 // Create the dummy factory
-                let dummy_factory = make_dummy_factory(use_splash, splash_pattern).await?;
+                let dummy_factory = make_dummy_factory(use_splash, splash_pattern);
                 dummy_factory.add_permitted_roles(&permitted_users);
                 let mut supported_streams_1 = supported_streams.clone();
                 let mut supported_streams_2 = supported_streams.clone();
                 let mut supported_streams_3 = supported_streams.clone();
                 tokio::select! {
                     v = async {
-                        let name = camera.config().await?.borrow().name.clone();
-                        let mut paths = vec![
-                            format!("/{name}/main"),
-                            format!("/{name}/Main"),
-                            format!("/{name}/mainStream"),
-                            format!("/{name}/MainStream"),
-                            format!("/{name}/Mainstream"),
-                            format!("/{name}/mainstream"),
-                        ];
+                        let mut paths = stream_paths(&name, StreamKind::Main);
                         paths.push(
                             format!("/{name}")
                         );
@@ -366,15 +297,7 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         stream_main(camera.clone(), StreamKind::Main, rtsp, &permitted_users, &paths).await
                     }, if active_streams.contains(&StreamKind::Main) => v,
                     v = async {
-                        let name = camera.config().await?.borrow().name.clone();
-                        let mut paths = vec![
-                            format!("/{name}/sub"),
-                            format!("/{name}/Sub"),
-                            format!("/{name}/subStream"),
-                            format!("/{name}/SubStream"),
-                            format!("/{name}/Substream"),
-                            format!("/{name}/substream"),
-                        ];
+                        let mut paths = stream_paths(&name, StreamKind::Sub);
                         if ! active_streams.contains(&StreamKind::Main) {
                             paths.push(
                                 format!("/{name}")
@@ -401,15 +324,7 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         stream_main(camera.clone(), StreamKind::Sub, rtsp, &permitted_users, &paths).await
                     }, if active_streams.contains(&StreamKind::Sub) => v,
                     v = async {
-                        let name = camera.config().await?.borrow().name.clone();
-                        let mut paths = vec![
-                            format!("/{name}/extern"),
-                            format!("/{name}/Extern"),
-                            format!("/{name}/externStream"),
-                            format!("/{name}/ExternStream"),
-                            format!("/{name}/Externstream"),
-                            format!("/{name}/externstream"),
-                        ];
+                        let mut paths = stream_paths(&name, StreamKind::Extern);
                         if ! active_streams.contains(&StreamKind::Main) && ! active_streams.contains(&StreamKind::Sub) {
                             paths.push(
                                 format!("/{name}")
@@ -443,4 +358,118 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
     }?;
 
     Ok(())
+}
+
+/// The paths a stream is served at. The camera's own path, without a stream,
+/// also serves the first of its main, sub and extern streams that is enabled.
+fn stream_paths(name: &str, stream: StreamKind) -> Vec<String> {
+    let (lower, upper) = match stream {
+        StreamKind::Main => ("main", "Main"),
+        StreamKind::Sub => ("sub", "Sub"),
+        StreamKind::Extern => ("extern", "Extern"),
+    };
+    vec![
+        format!("/{name}/{lower}"),
+        format!("/{name}/{upper}"),
+        format!("/{name}/{lower}Stream"),
+        format!("/{name}/{upper}Stream"),
+        format!("/{name}/{upper}stream"),
+        format!("/{name}/{lower}stream"),
+    ]
+}
+
+/// Stops serving a camera that was disabled or removed
+fn unmount_camera(rtsp: &NeoRtspServer, name: &str) {
+    let Some(mounts) = rtsp.mount_points() else {
+        return;
+    };
+    for stream in [StreamKind::Main, StreamKind::Sub, StreamKind::Extern] {
+        for path in stream_paths(name, stream) {
+            mounts.remove_factory(&path);
+        }
+    }
+    mounts.remove_factory(&format!("/{name}"));
+}
+
+/// Keeps `supported` up to date with the streams the camera offers. They are
+/// checked whenever the camera connects and every few minutes, and retried
+/// with backoff after an error. Returns only if the camera is gone.
+async fn poll_supported_streams(
+    camera: NeoInstance,
+    supported: WatchSender<HashSet<StreamKind>>,
+) -> AnyResult<()> {
+    let name = camera.config().await?.borrow().name.clone();
+    let mut connection = camera.camera();
+    let mut backoff = Backoff::new(Duration::from_secs(1), STREAM_INFO_INTERVAL);
+    loop {
+        let stream_info = camera
+            .run_passive_task(|cam| Box::pin(async move { Ok(cam.get_stream_info().await?) }))
+            .await;
+        let wait = match stream_info {
+            Ok(stream_info) => {
+                let streams = stream_info
+                    .stream_infos
+                    .iter()
+                    .flat_map(|stream_info| stream_info.encode_tables.clone())
+                    .flat_map(|encode| match encode.name.as_str() {
+                        "mainStream" => Some(StreamKind::Main),
+                        "subStream" => Some(StreamKind::Sub),
+                        "externStream" => Some(StreamKind::Extern),
+                        new_stream_name => {
+                            log::debug!("New stream name {}", new_stream_name);
+                            None
+                        }
+                    })
+                    .collect::<HashSet<_>>();
+                supported.send_if_modified(|old| {
+                    if *old != streams {
+                        *old = streams;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                backoff.reset();
+                STREAM_INFO_INTERVAL
+            }
+            Err(e) => {
+                let delay = backoff.next_delay();
+                log::warn!(
+                    "{name}: Could not learn the camera's streams, retrying in {delay:.1?}: {e:#}"
+                );
+                delay
+            }
+        };
+        tokio::select! {
+            _ = sleep(wait) => {}
+            changed = connection.changed() => {
+                changed.context("The camera is gone")?;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_stream_keeps_its_six_paths() {
+        assert_eq!(
+            stream_paths("cam", StreamKind::Main),
+            [
+                "/cam/main",
+                "/cam/Main",
+                "/cam/mainStream",
+                "/cam/MainStream",
+                "/cam/Mainstream",
+                "/cam/mainstream"
+            ]
+        );
+        assert_eq!(stream_paths("cam", StreamKind::Sub)[5], "/cam/substream");
+        assert_eq!(
+            stream_paths("cam", StreamKind::Extern)[3],
+            "/cam/ExternStream"
+        );
+    }
 }

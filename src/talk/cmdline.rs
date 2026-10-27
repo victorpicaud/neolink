@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -9,6 +9,7 @@ use std::str::FromStr;
 ///
 /// `gst-launch` can be used to prepare this data
 #[derive(Parser, Debug)]
+#[command(group(ArgGroup::new("input").required(true).args(["file_path", "microphone"])))]
 pub struct Opt {
     /// The name of the camera to talk through. Must be a name in the config
     pub camera: String,

@@ -14,19 +14,23 @@ use tokio::{
         watch::{channel as watch, Receiver as WatchReceiver, Sender as WatchSender},
     },
     task::JoinSet,
-    time::{sleep, Duration},
+    time::{interval, sleep, timeout, Duration},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance, Permit,
-    UseCounter,
+    Backoff, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance,
+    Permit, UseCounter,
 };
+#[cfg(feature = "gstreamer")]
+use super::{HubSubscription, StreamHub};
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
-use crate::{config::CameraConfig, AnyResult, Result};
+use crate::{config::CameraConfig, healthcheck::Heartbeat, AnyResult, Result};
 use neolink_core::bc_protocol::BcCamera;
+#[cfg(feature = "gstreamer")]
+use {neolink_core::bc_protocol::StreamKind, std::collections::HashMap};
 
 #[allow(dead_code)]
 pub(crate) enum NeoCamCommand {
@@ -41,6 +45,11 @@ pub(crate) enum NeoCamCommand {
     #[cfg(feature = "pushnoti")]
     PushNoti(OneshotSender<WatchReceiver<Option<PushNoti>>>),
     GetUid(OneshotSender<String>),
+    /// Reconnect to the camera
+    Reconnect(OneshotSender<()>),
+    /// A subscription to the camera's stream, which runs once for all of them
+    #[cfg(feature = "gstreamer")]
+    Stream(StreamKind, OneshotSender<Option<HubSubscription>>),
 }
 /// The underlying camera binding
 pub(crate) struct NeoCam {
@@ -61,6 +70,7 @@ impl NeoCam {
         let (camera_watch_tx, camera_watch_rx) = watch(Weak::new());
         let (md_request_tx, md_request_rx) = mpsc(100);
         let (state_tx, state_rx) = watch(NeoCamThreadState::Connected);
+        let (reconnect_tx, reconnect_rx) = watch(0u64);
         let (uid_tx, uid_rx) = watch(config.camera_uid.clone());
 
         let set = JoinSet::new();
@@ -93,6 +103,8 @@ impl NeoCam {
                     Result::Ok(())
                 },
                 v = async {
+                    #[cfg(feature = "gstreamer")]
+                    let mut hubs: HashMap<StreamKind, StreamHub> = HashMap::new();
                     while let Some(command) = commander_rx.next().await {
                         match command {
                             NeoCamCommand::HangUp => {
@@ -108,11 +120,12 @@ impl NeoCam {
                                 let _ = result.send(instance);
                             }
                             NeoCamCommand::Motion(sender) => {
-                                md_request_tx.send(
-                                    MdRequest::Get {
-                                        sender,
-                                    }
-                                ).await?;
+                                // Never wait on another actor from this loop:
+                                // if it is busy every command would stall
+                                let md_request_tx = md_request_tx.clone();
+                                tokio::task::spawn(async move {
+                                    let _ = md_request_tx.send(MdRequest::Get { sender }).await;
+                                });
                             },
                             NeoCamCommand::Config(sender) => {
                                 let _ = sender.send(thread_watch_config_rx.clone());
@@ -132,16 +145,20 @@ impl NeoCam {
                             NeoCamCommand::State(sender) => {
                                 let _ = sender.send(*state_tx.borrow());
                             }
+                            NeoCamCommand::Reconnect(sender) => {
+                                reconnect_tx.send_modify(|requests| *requests += 1);
+                                let _ = sender.send(());
+                            }
                             NeoCamCommand::GetPermit(sender) => {
                                 let _ = sender.send(users.create_activated().await?);
                             }
                             #[cfg(feature = "pushnoti")]
                             NeoCamCommand::PushNoti(sender) => {
-                                thread_pn_request_tx.send(
-                                    PnRequest::Get {
-                                        sender,
-                                    }
-                                ).await?;
+                                // Never wait on another actor from this loop
+                                let pn_request_tx = thread_pn_request_tx.clone();
+                                tokio::task::spawn(async move {
+                                    let _ = pn_request_tx.send(PnRequest::Get { sender }).await;
+                                });
                             },
                             NeoCamCommand::GetUid(sender) => {
                                 let mut uid_rx = uid_rx.clone();
@@ -151,6 +168,25 @@ impl NeoCam {
                                     AnyResult::Ok(())
                                 });
                             },
+                            #[cfg(feature = "gstreamer")]
+                            NeoCamCommand::Stream(stream, sender) => {
+                                let subscription = match hubs.get(&stream).and_then(StreamHub::subscribe) {
+                                    Some(subscription) => Some(subscription),
+                                    // The first, or the hub stopped
+                                    None => {
+                                        let instance = NeoInstance::new(
+                                            camera_watch_rx.clone(),
+                                            thread_commander_tx.clone(),
+                                            thread_cancel.clone(),
+                                        )?;
+                                        let hub = StreamHub::for_camera(instance, thread_watch_config_rx.clone(), stream);
+                                        let subscription = hub.subscribe();
+                                        hubs.insert(stream, hub);
+                                        subscription
+                                    }
+                                };
+                                let _ = sender.send(subscription);
+                            }
                         }
                     }
                     Ok(())
@@ -175,11 +211,38 @@ impl NeoCam {
         let mut cam_thread = NeoCamThread::new(
             state_rx,
             thread_watch_config_rx,
+            reconnect_rx,
             camera_watch_tx,
             me.cancel.clone(),
         )
         .await;
         me.set.spawn(async move { cam_thread.run().await });
+
+        // Beats for the healthcheck while the camera's actor answers, as one
+        // that froze stopped every command to its camera
+        let heartbeat = Heartbeat::new(
+            &format!("camera-{}", config.name),
+            &format!("camera {}", config.name),
+        );
+        let heartbeat_commander = commander_tx.clone();
+        let heartbeat_cancel = me.cancel.clone();
+        me.set.spawn(async move {
+            let mut ticks = interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = heartbeat_cancel.cancelled() => return AnyResult::Ok(()),
+                    _ = ticks.tick() => {}
+                }
+                let (reply, answer) = oneshot();
+                if heartbeat_commander
+                    .try_send(NeoCamCommand::Config(reply))
+                    .is_ok()
+                    && matches!(timeout(Duration::from_secs(5), answer).await, Ok(Ok(_)))
+                {
+                    heartbeat.beat();
+                }
+            }
+        });
 
         // This thread monitors the motion
         let md_instance = instance.subscribe().await?;
@@ -238,12 +301,33 @@ impl NeoCam {
                     AnyResult::Ok(())
                 },
                 v = async {
-                    let uid = uid_instance.run_task(|cam| Box::pin(async move {
-                        let uid = cam.uid().await?;
-                        Ok(uid)
-                    })).await?;
-                    uid_tx.send_replace(Some(uid));
-                    AnyResult::Ok(())
+                    // One failure used to end this for good, and every
+                    // request for the UID then waited forever
+                    let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(300));
+                    let mut uid = uid_instance.run_task(|cam| Box::pin(async move {
+                        Ok(cam.uid().await?)
+                    })).await;
+                    loop {
+                        match uid {
+                            Ok(uid) => {
+                                uid_tx.send_replace(Some(uid));
+                                break AnyResult::Ok(());
+                            }
+                            Err(e) if matches!(e.downcast_ref::<neolink_core::Error>(), Some(neolink_core::Error::CameraServiceUnavailable { .. })) => {
+                                log::debug!("The camera does not tell its UID: {e:#}");
+                                break AnyResult::Ok(());
+                            }
+                            Err(e) => {
+                                let delay = backoff.next_delay();
+                                log::debug!("Could not get the camera's UID, retrying in {delay:.1?}: {e:#}");
+                                sleep(delay).await;
+                            }
+                        }
+                        // Without keeping a battery camera awake for it
+                        uid = uid_instance.run_passive_task(|cam| Box::pin(async move {
+                            Ok(cam.uid().await?)
+                        })).await;
+                    }
                 } => v,
             }
         });
@@ -314,7 +398,8 @@ impl NeoCam {
                     loop{
                         md.wait_for(|md| matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
                         let _permit = md_permit_instance.permit().await.with_context(|| "Unuable to acquire motion permit")?;
-                        md.wait_for(|md| matches!(md, MdState::Stop(_))).await.with_context(|| "MD Watcher lost")?;
+                        // Unknown too: the camera went away
+                        md.wait_for(|md| !matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
                         // Try waiting for 30s
                         // If in those 30s we get motion then return to
                         // loop early to reaquire the permit
@@ -385,6 +470,11 @@ impl NeoCam {
         Ok(me)
     }
 
+    /// Whether the camera's actor ended: it no longer answers
+    pub(crate) fn is_dead(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
     pub(crate) async fn subscribe(&self) -> Result<NeoInstance> {
         NeoInstance::new(
             self.camera_watch.clone(),
@@ -394,8 +484,33 @@ impl NeoCam {
     }
 
     pub(crate) async fn update_config(&self, config: CameraConfig) -> Result<()> {
-        self.config_watch.send_replace(config);
+        // Every config update reaches every camera, and a camera told of a
+        // change reconnects, so only tell it when its own config changed
+        self.config_watch.send_if_modified(|current| {
+            if *current != config {
+                *current = config;
+                true
+            } else {
+                false
+            }
+        });
         Ok(())
+    }
+
+    /// Stops the camera, which logs out, and waits for it. Whatever has not
+    /// stopped in time is aborted.
+    pub(crate) async fn shutdown(mut self) {
+        const STOP_TIME: Duration = Duration::from_secs(3);
+        self.cancel.cancel();
+        let mut set = std::mem::take(&mut self.set);
+        let stopped = timeout(STOP_TIME, async {
+            while set.join_next().await.is_some() {}
+        })
+        .await;
+        if stopped.is_err() {
+            let name = self.config_watch.borrow().name.clone();
+            log::warn!("{name}: The camera took over {STOP_TIME:?} to stop");
+        }
     }
 }
 
@@ -404,11 +519,56 @@ impl Drop for NeoCam {
         log::trace!("Drop NeoCam");
         let mut set = std::mem::take(&mut self.set);
         let commander = self.commander.clone();
-        let _gt = tokio::runtime::Handle::current().enter();
-        tokio::task::spawn(async move {
+        crate::utils::spawn_cleanup(async move {
             let _ = commander.send(NeoCamCommand::HangUp).await;
             while set.join_next().await.is_some() {}
             log::trace!("Dropped NeoCam");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera_config(use_splash: bool) -> CameraConfig {
+        let config: crate::config::Config = toml::from_str(&format!(
+            "[[cameras]]\nname = \"cam\"\nusername = \"admin\"\naddress = \"127.0.0.1:1\"\nuse_splash = {use_splash}\n"
+        ))
+        .unwrap();
+        config.cameras[0].clone()
+    }
+
+    #[tokio::test]
+    async fn only_a_changed_config_reaches_the_camera() -> AnyResult<()> {
+        #[cfg(feature = "pushnoti")]
+        let camera = NeoCam::new(camera_config(true), tokio::sync::mpsc::channel(1).0).await?;
+        #[cfg(not(feature = "pushnoti"))]
+        let camera = NeoCam::new(camera_config(true)).await?;
+        let mut config = camera.subscribe().await?.config().await?;
+        config.borrow_and_update();
+
+        camera.update_config(camera_config(true)).await?;
+        assert!(
+            !config.has_changed()?,
+            "an unchanged config must not disturb the camera"
+        );
+        camera.update_config(camera_config(false)).await?;
+        assert!(config.has_changed()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_camera_stops_when_told() -> AnyResult<()> {
+        #[cfg(feature = "pushnoti")]
+        let camera = NeoCam::new(camera_config(true), tokio::sync::mpsc::channel(1).0).await?;
+        #[cfg(not(feature = "pushnoti"))]
+        let camera = NeoCam::new(camera_config(true)).await?;
+        let instance = camera.subscribe().await?;
+
+        // Well before its time to stop runs out, since every task stops
+        timeout(Duration::from_secs(2), camera.shutdown()).await?;
+        assert!(instance.config().await.is_err(), "the camera still answers");
+        Ok(())
     }
 }

@@ -1,3 +1,4 @@
+use super::reliable::ReliableState;
 use super::DiscoveryResult;
 use crate::bc::codex::BcCodex;
 use crate::bc::model::*;
@@ -11,8 +12,7 @@ use futures::{
     stream::{IntoAsyncRead, Stream, StreamExt, TryStreamExt},
 };
 use rand::{seq::SliceRandom, thread_rng, Rng};
-use std::collections::BTreeMap;
-use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::io::{Error as IoError, Result as IoResult};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 use tokio::{
     net::UdpSocket,
     sync::{
-        mpsc::channel,
+        mpsc::{channel, error::TrySendError},
         watch::{channel as watch, Sender as WatchSender},
     },
     task::JoinSet,
@@ -280,9 +280,8 @@ impl Drop for UdpPayloadSource {
     fn drop(&mut self) {
         log::trace!("Drop UdpPayloadSource");
         self.cancel_token.cancel();
-        let _gt = tokio::runtime::Handle::current().enter();
         let mut set = std::mem::take(&mut self.set);
-        tokio::task::spawn(async move {
+        crate::spawn_cleanup(async move {
             while set.join_next().await.is_some() {}
             log::trace!("Dropped UdpPayloadSource");
         });
@@ -298,10 +297,7 @@ struct UdpPayloadInner {
     thread_sink: ReceiverStream<Vec<u8>>,
     client_id: i32,
     camera_id: i32,
-    packets_sent: u32,
-    packets_want: u32,
-    sent: BTreeMap<u32, UdpData>,
-    recieved: BTreeMap<u32, Vec<u8>>,
+    reliable: ReliableState,
     /// Offical Client does ack every 10ms if we don't also do this the camera
     /// seems to think we have a poor connection and will abort
     /// This `ack_interval` controls how ofen we do this
@@ -355,10 +351,32 @@ impl UdpPayloadInner {
                             }
                             packet = inner.next() => {
                                 log::trace!("Cam->App");
-                                let packet = packet.ok_or(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved))??;
-                                recv_timeout.as_mut().reset(Instant::now() + Duration::from_secs(TIME_OUT));
-                                // let packet = socket_rx.next().await.ok_or(Error::BcUdpDropReciver)??;
-                                socket_out_tx.try_send(packet).map_err(|e| Error::BcUdpDropReciver(BcUdpDropReciverKind::SendFailed(format!("{e:?}"))))?;
+                                let (packet, addr) = match packet {
+                                    None => break Err(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved)),
+                                    // The socket failed, or the camera or relay ended the connection
+                                    Some(Err(e @ (Error::Io(_) | Error::RelayTerminate | Error::CameraTerminate))) => break Err(e),
+                                    // Not worth the connection: the next datagram is read as usual
+                                    Some(Err(e)) => {
+                                        log::debug!("Skipping a UDP datagram that could not be parsed: {e}");
+                                        continue;
+                                    }
+                                    Some(Ok(packet)) => packet,
+                                };
+                                // Only the camera keeps the connection alive
+                                if addr == thread_camera_addr {
+                                    recv_timeout.as_mut().reset(Instant::now() + Duration::from_secs(TIME_OUT));
+                                }
+                                match socket_out_tx.try_send((packet, addr)) {
+                                    Ok(()) => {}
+                                    // The camera sends a lost packet again. A full queue used to end
+                                    // the connection (#390).
+                                    Err(TrySendError::Full(_)) => {
+                                        log::debug!("UDP packets arrive faster than they are read, dropping one");
+                                    }
+                                    Err(e @ TrySendError::Closed(_)) => {
+                                        break Err(Error::BcUdpDropReciver(BcUdpDropReciverKind::SendFailed(format!("{e:?}"))));
+                                    }
+                                }
                                 continue;
                             },
                             packet = socket_in_rx.next() => {
@@ -467,11 +485,13 @@ impl UdpPayloadInner {
             thread_sink,
             client_id,
             camera_id,
-            packets_sent: 0,
-            packets_want: 0,
-            sent: Default::default(),
-            recieved: Default::default(),
-            resend_interval: interval(Duration::from_millis(500)), // Offical Client does resend every 500ms
+            reliable: ReliableState::new(),
+            resend_interval: {
+                // Offical Client does resend every 500ms
+                let mut resend = interval(Duration::from_millis(500));
+                resend.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                resend
+            },
             ack_latency: Default::default(),
             cancel,
             set,
@@ -479,29 +499,29 @@ impl UdpPayloadInner {
     }
     async fn run(&mut self) -> Result<()> {
         let camera_addr = self.camera_addr;
+        let can_send = self.reliable.can_send();
         tokio::select! {
             _ = self.resend_interval.tick() => {
                 log::trace!("Resend Tick");
-                for (_, resend) in self.sent.iter() {
+                for resend in self.reliable.unacked() {
                     self.socket_in.feed(BcUdp::Data(resend.clone())).await?;
                 }
-                self.ack_tx.send_replace(self.build_send_ack()); // Ensure we update the ack packet sometimes too
+                let skipped = self.reliable.skip_gap(std::time::Instant::now());
+                if skipped > 0 {
+                    // The stream on top resyncs to the next message
+                    log::warn!("Gave up on {skipped} UDP packets that the camera did not send again");
+                }
                 Result::Ok(())
             },
-            v = self.thread_sink.next() => {
+            // Waits while too much waits for an ack
+            v = self.thread_sink.next(), if can_send => {
                 log::trace!("App->Camera");
                 // Incomming from application
                 // Outgoing on socket
                 let item = v.ok_or(Error::BcUdpDropSender)?;
 
                 for chunk in item.chunks(MTU - UDPDATA_HEADER_SIZE) {
-                    let udp_data = UdpData {
-                        connection_id: self.camera_id,
-                        packet_id: self.packets_sent,
-                        payload: chunk.to_vec(),
-                    };
-                    self.packets_sent += 1;
-                    self.sent.insert(udp_data.packet_id, udp_data.clone());
+                    let udp_data = self.reliable.send(self.camera_id, chunk.to_vec());
                     self.socket_in.feed(BcUdp::Data(udp_data)).await?;
                 }
                 Ok(())
@@ -510,7 +530,9 @@ impl UdpPayloadInner {
                 log::trace!("Camera->App");
                 // Incomming from socket
                 // Outgoing to application
-                let (item, addr) = v.ok_or(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved))?;
+                let Some((item, addr)) = v else {
+                    return Err(self.socket_error().await);
+                };
                 if addr == camera_addr {
                     match item {
                         BcUdp::Discovery(UdpDiscovery{
@@ -535,12 +557,7 @@ impl UdpPayloadInner {
                         },
                         BcUdp::Data(data)  => {
                             if data.connection_id == self.client_id {
-                                let packet_id = data.packet_id;
-                                if packet_id >= self.packets_want {
-                                    // error!("packets_want: {}", this.packets_want);
-                                    self.recieved.insert(packet_id, data.payload);
-                                    self.ack_tx.send_replace(self.build_send_ack());
-                                }
+                                self.reliable.on_data(data.packet_id, data.payload, std::time::Instant::now());
                             }
                         },
                     }
@@ -550,12 +567,10 @@ impl UdpPayloadInner {
             },
         }?;
         log::trace!("Send");
-        while let Some(payload) = self.recieved.remove(&self.packets_want) {
-            log::trace!("  + {}", self.packets_want);
-            self.packets_want += 1;
+        for payload in self.reliable.pop_ready(std::time::Instant::now()) {
             self.thread_stream.feed(Ok(payload)).await?;
         }
-        log::trace!("recieved: {}", self.recieved.len());
+        self.ack_tx.send_replace(self.build_send_ack());
         log::trace!("Flush");
         self.socket_in.flush().await?;
         self.thread_stream.flush().await?;
@@ -563,57 +578,24 @@ impl UdpPayloadInner {
         Ok(())
     }
 
-    fn build_send_ack(&self) -> UdpAck {
-        if self.packets_want > 0 {
-            let mut first_missing: u32 = self.packets_want;
-            while self.recieved.contains_key(&first_missing) {
-                // Happens if we have recieved but not consumed yet
-                first_missing += 1;
+    /// The error that ended the socket task, which closed `socket_out`
+    async fn socket_error(&mut self) -> Error {
+        while let Some(ended) = self.set.join_next().await {
+            if let Ok(Err(e)) = ended {
+                return e;
             }
-            let missing_ids = if let Some(end) = self.recieved.keys().max() {
-                let mut vec = vec![];
-                // From last contiguous packet to last recieved packet
-                // create a payload of `00` (unreceived) and `01` (received)
-                // that can be used to form the `UdpAck` packet
-                for i in (first_missing)..(end + 1) {
-                    if self.recieved.contains_key(&i) {
-                        vec.push(1)
-                    } else {
-                        vec.push(0)
-                    }
-                }
-                vec
-            } else {
-                vec![]
-            };
-
-            UdpAck {
-                connection_id: self.camera_id,
-                packet_id: first_missing - 1, // Last we actually have is first_missing - 1
-                group_id: 0,
-                maybe_latency: self.ack_latency.get_value(),
-                payload: missing_ids,
-            }
-        } else {
-            UdpAck::empty(self.camera_id)
         }
+        Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved)
+    }
+
+    fn build_send_ack(&self) -> UdpAck {
+        self.reliable
+            .ack(self.camera_id, self.ack_latency.get_value())
     }
 
     fn handle_ack(&mut self, ack: UdpAck) {
-        let start = ack.packet_id;
-        if start != 0xffffffff {
-            // -1 means havent got anything yet
-            self.sent.retain(|&k, _| k > start);
-
-            for (idx, &value) in ack.payload.iter().enumerate() {
-                let packet_id = (start + 1) + idx as u32;
-                if value > 0 {
-                    self.sent.remove(&packet_id);
-                }
-            }
-        }
+        self.reliable.on_ack(&ack);
         self.ack_latency.feed_ack();
-        log::trace!("sent: {}", self.sent.len());
     }
 }
 
@@ -621,9 +603,8 @@ impl Drop for UdpPayloadInner {
     fn drop(&mut self) {
         log::trace!("Drop UdpPayloadInner");
         self.cancel.cancel();
-        let _gt = tokio::runtime::Handle::current().enter();
         let mut set = std::mem::take(&mut self.set);
-        tokio::task::spawn(async move {
+        crate::spawn_cleanup(async move {
             while set.join_next().await.is_some() {}
             log::trace!("Dropped UdpPayloadInner");
         });
@@ -664,7 +645,7 @@ impl UdpPayloadSource {
                                 // Pass error up
                                 let _ = payload_inner
                                     .thread_stream
-                                    .send(Err(IoError::new(ErrorKind::Other, e.clone())))
+                                    .send(Err(IoError::other(e.clone())))
                                     .await;
                                 return Result::<()>::Err(e);
                             }
@@ -710,13 +691,13 @@ impl Sink<Vec<u8>> for UdpPayloadSource {
         self.get_mut()
             .inner_sink
             .poll_ready_unpin(cx)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))
+            .map_err(IoError::other)
     }
     fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> std::result::Result<(), Self::Error> {
         self.get_mut()
             .inner_sink
             .start_send_unpin(item)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))
+            .map_err(IoError::other)
     }
     fn poll_flush(
         self: Pin<&mut Self>,
@@ -725,7 +706,7 @@ impl Sink<Vec<u8>> for UdpPayloadSource {
         self.get_mut()
             .inner_sink
             .poll_flush_unpin(cx)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))
+            .map_err(IoError::other)
     }
 
     fn poll_close(
@@ -735,7 +716,7 @@ impl Sink<Vec<u8>> for UdpPayloadSource {
         self.get_mut()
             .inner_sink
             .poll_close_unpin(cx)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))
+            .map_err(IoError::other)
     }
 }
 

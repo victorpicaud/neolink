@@ -227,6 +227,10 @@ local function hexencode(str)
      return (str:gsub(".", function(char) return string.format("%02X", char:byte()) end))
 end
 local gcrypt = require("luagcrypt")
+
+-- Wireshark's own LuaBitOp. Lua 5.4, which Wireshark 4.4 moved to, has no
+-- bit32 (#389).
+local bitops = bit or bit32
 local function aes_decrypt(data, pinfo)
     local nonce_key = tostring(pinfo.src) .. ":" .. pinfo.src_port
     local nonce = (_G.nonce[nonce_key] or "")
@@ -249,7 +253,8 @@ local function xml_decrypt(ba, offset)
   local e = ByteArray.new()
   e:set_size(ba:len())
   for i=0,ba:len() - 1 do
-    e:set_index(i, bit32.bxor(bit32.band(offset, 0xFF), bit32.bxor(ba:get_index(i), key:byte(((i + offset) % 8) + 1))))
+    local key_byte = key:byte(((i + offset) % 8) + 1)
+    e:set_index(i, bitops.bxor(bitops.band(offset, 0xFF), bitops.bxor(ba:get_index(i), key_byte)))
   end
   return e
 end
@@ -317,7 +322,7 @@ local function process_header(buffer, headers_tree)
   header:add_le(message_len, buffer(8, 4))
 
   header:add_le(xml_enc_offset, buffer(12, 1))
-        :append_text(" (& 0xF == " .. bit32.band(header_data.enc_offset, 0xF) .. ")")
+        :append_text(" (& 0xF == " .. bitops.band(header_data.enc_offset, 0xF) .. ")")
 
   header:add_le(channel_id, buffer(12, 1))
   header:add_le(stream_id, buffer(13, 1))
@@ -448,13 +453,13 @@ local function udp_decrypt(data, tid)
   end
 
   for x=0, rshift(i, 2) do
-    local index = bit32.band(x, 7)
+    local index = bitops.band(x, 7)
     local xor_key_word = key[index + 1]
     for b=0, 3 do
       local byte_index = x * 4 + b
       local val = data:get_index(byte_index)
-      local key_byte = bit32.extract(xor_key_word, b*8, 8)
-      val = bit32.bxor(key_byte, val)
+      local key_byte = bitops.band(bitops.rshift(xor_key_word, b * 8), 0xFF)
+      val = bitops.bxor(key_byte, val)
       result:set_index(byte_index, val)
       if byte_index >= data:len() - 1 then
         return result

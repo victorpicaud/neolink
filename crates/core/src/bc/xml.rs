@@ -147,7 +147,7 @@ impl BcXml {
     pub(crate) fn try_parse(s: impl BufRead) -> Result<Self, quick_xml::de::DeError> {
         quick_xml::de::from_reader(s)
     }
-    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::de::DeError> {
+    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::SeError> {
         let mut writer = quick_xml::writer::Writer::new(&mut w);
         writer
             .write_event(quick_xml::events::Event::Decl(
@@ -163,7 +163,7 @@ impl Extension {
     pub(crate) fn try_parse(s: impl BufRead) -> Result<Self, quick_xml::de::DeError> {
         quick_xml::de::from_reader(s)
     }
-    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::de::DeError> {
+    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::SeError> {
         let mut writer = quick_xml::writer::Writer::new(&mut w);
         writer
             .write_event(quick_xml::events::Event::Decl(
@@ -465,9 +465,10 @@ pub struct RfAlarmCfg {
     /// XML Version
     #[serde(rename = "@version")]
     pub version: String,
-    /// Rfid
-    #[serde(rename = "rfID")]
-    pub rf_id: u8,
+    /// Rfid. Some cameras leave it out, and then it is left out when the
+    /// config is sent back too (#397)
+    #[serde(default, rename = "rfID", skip_serializing_if = "Option::is_none")]
+    pub rf_id: Option<u8>,
     /// PIR status
     pub enable: u8,
     /// PIR sensitivity
@@ -603,9 +604,9 @@ pub struct DuplexList {
 /// audioStreamModeList xml
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
 pub struct AudioStreamModeList {
-    /// The supported audio stream mode
-    #[serde(rename = "audioStreamMode")]
-    pub audio_stream_mode: String,
+    /// The supported audio stream modes. The Video Doorbell lists two (#371)
+    #[serde(default, rename = "audioStreamMode")]
+    pub audio_stream_mode: Vec<String>,
 }
 
 /// audioConfigList xml
@@ -694,7 +695,9 @@ pub struct Preset {
     /// The preset name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Command: Known values: `"toPos"` and `"setPos"`
+    /// Command: Known values: `"toPos"` and `"setPos"`. Cameras leave it out
+    /// of the preset list they send (#326)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
 }
 
@@ -1881,7 +1884,7 @@ fn test_binary_deser() {
 fn test_enc3_extension() {
     let _ = env_logger::builder().is_test(true).try_init();
     let sample = indoc!(
-        r#"<?xml version="1.0\" encoding="UTF-8" ?>
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
         <Extension version="1.1">
         <encryptLen>1024</encryptLen>
         <binaryData>1</binaryData>
@@ -1963,4 +1966,97 @@ fn test_empty_floodlight_status_list() {
         } if version == "1.1" && floodlight_status_list.is_empty() => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn a_doorbell_lists_two_audio_stream_modes() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    // Reolink Video Doorbell WiFi-W, v3.0.0.4662_2503122283 (#371)
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <TalkAbility version="1.1">
+        <duplexList>
+        <duplex>FDX</duplex>
+        </duplexList>
+        <audioStreamModeList>
+        <audioStreamMode>followVideoStream</audioStreamMode>
+        <audioStreamMode>mixAudioStream</audioStreamMode>
+        </audioStreamModeList>
+        <audioConfigList>
+        <audioConfig>
+        <priority>0</priority>
+        <audioType>adpcm</audioType>
+        <sampleRate>16000</sampleRate>
+        <samplePrecision>16</samplePrecision>
+        <lengthPerEncoder>1024</lengthPerEncoder>
+        <soundTrack>mono</soundTrack>
+        </audioConfig>
+        </audioConfigList>
+        </TalkAbility>
+        </body>
+        "#
+    );
+    let talk = BcXml::try_parse(sample.as_bytes())
+        .unwrap()
+        .talk_ability
+        .unwrap();
+    assert_eq!(
+        talk.audio_stream_mode_list[0].audio_stream_mode,
+        ["followVideoStream", "mixAudioStream"]
+    );
+}
+
+#[test]
+fn a_preset_list_without_commands_parses() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    // As an Argus PT Ultra sends it (#326)
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <PtzPreset version="1.1">
+        <channelId>0</channelId>
+        <presetList>
+        <preset>
+        <id>1</id>
+        <name>pos1</name>
+        <imageName>preset_00_0.jpg</imageName>
+        </preset>
+        </presetList>
+        </PtzPreset>
+        </body>
+        "#
+    );
+    let presets = BcXml::try_parse(sample.as_bytes())
+        .unwrap()
+        .ptz_preset
+        .unwrap();
+    assert_eq!(presets.preset_list.preset[0].name.as_deref(), Some("pos1"));
+    assert_eq!(presets.preset_list.preset[0].command, "");
+}
+
+#[test]
+fn a_pir_config_without_an_rf_id_parses_and_is_sent_back_without_one() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    // As an Altas PT Ultra sends it (#397)
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <rfAlarmCfg version="1.1">
+        <enable>1</enable>
+        <sensitivity>2</sensitivity>
+        <sensiValue>16</sensiValue>
+        <reduceFalseAlarm>0</reduceFalseAlarm>
+        <timeBlockList>
+        </timeBlockList>
+        <alarmHandle>
+        </alarmHandle>
+        </rfAlarmCfg>
+        </body>
+        "#
+    );
+    let xml = BcXml::try_parse(sample.as_bytes()).unwrap();
+    assert_eq!(xml.rf_alarm_cfg.as_ref().unwrap().rf_id, None);
+    let sent = String::from_utf8(xml.serialize(vec![]).unwrap()).unwrap();
+    assert!(!sent.contains("rfID"), "{sent}");
 }

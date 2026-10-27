@@ -69,6 +69,15 @@ struct DiscoveryAvaliablity {
     payload_not_available: Option<String>,
 }
 
+/// An entity is available while both its camera and neolink are connected.
+/// Home Assistant took neither for gone: it waits for "offline" by default,
+/// which a camera never says, and neolink's own status was not watched.
+#[derive(Serialize, Debug, Clone)]
+struct Availability {
+    availability: Vec<DiscoveryAvaliablity>,
+    availability_mode: String,
+}
+
 #[derive(Serialize, Debug)]
 struct DiscoveryLight {
     name: String,
@@ -76,7 +85,8 @@ struct DiscoveryLight {
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     device: DiscoveryDevice,
-    availability: DiscoveryAvaliablity,
+    #[serde(flatten)]
+    availability: Availability,
     // Light specific
     #[serde(skip_serializing_if = "Option::is_none")]
     state_topic: Option<String>,
@@ -109,7 +119,8 @@ struct DiscoveryCamera {
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     device: DiscoveryDevice,
-    availability: DiscoveryAvaliablity,
+    #[serde(flatten)]
+    availability: Availability,
     // Camera specific
     topic: String,
     #[serde(skip_serializing_if = "Encoding::is_none")]
@@ -123,7 +134,8 @@ struct DiscoverySwitch {
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     device: DiscoveryDevice,
-    availability: DiscoveryAvaliablity,
+    #[serde(flatten)]
+    availability: Availability,
     // Switch specific
     // - Control
     command_topic: String,
@@ -145,7 +157,8 @@ struct DiscoverySelect {
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     device: DiscoveryDevice,
-    availability: DiscoveryAvaliablity,
+    #[serde(flatten)]
+    availability: Availability,
     // Switch specific
     // - Control
     command_topic: String,
@@ -162,7 +175,8 @@ struct DiscoveryBinarySensor {
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     device: DiscoveryDevice,
-    availability: DiscoveryAvaliablity,
+    #[serde(flatten)]
+    availability: Availability,
     // BinarySensor specific
     payload_off: String,
     payload_on: String,
@@ -177,7 +191,8 @@ struct DiscoveryButton {
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     device: DiscoveryDevice,
-    availability: DiscoveryAvaliablity,
+    #[serde(flatten)]
+    availability: Availability,
     // Button specific
     command_topic: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,11 +206,30 @@ struct DiscoverySensor {
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<String>,
     device: DiscoveryDevice,
-    availability: DiscoveryAvaliablity,
+    #[serde(flatten)]
+    availability: Availability,
     // Button specific
     state_topic: String,
     state_class: String,
     unit_of_measurement: String,
+}
+
+fn availability(camera: &str) -> Availability {
+    Availability {
+        availability: vec![
+            DiscoveryAvaliablity {
+                topic: format!("neolink/{camera}/status"),
+                payload_available: Some("connected".to_string()),
+                payload_not_available: Some("disconnected".to_string()),
+            },
+            DiscoveryAvaliablity {
+                topic: "neolink/status".to_string(),
+                payload_available: Some("connected".to_string()),
+                payload_not_available: Some("offline".to_string()),
+            },
+        ],
+        availability_mode: "all".to_string(),
+    }
 }
 
 /// Enables MQTT discovery for a camera. See docs at https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery
@@ -239,11 +273,7 @@ pub(crate) async fn enable_discovery(
         sw_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
 
-    let availability = DiscoveryAvaliablity {
-        topic: format!("neolink/{}/status", cam_config.name),
-        payload_available: Some("connected".to_string()),
-        payload_not_available: None,
-    };
+    let availability = availability(&cam_config.name);
 
     for feature in &discovery_config.features {
         match feature {
@@ -272,10 +302,7 @@ pub(crate) async fn enable_discovery(
 
                 // Each feature needs to be individually registered
                 mqtt.send_message_with_root_topic(
-                    &format!(
-                        "{}/light/{}",
-                        discovery_config.topic, &config_data.unique_id
-                    ),
+                    &format!("{}/light/{}", discovery_config.topic, config_data.unique_id),
                     "config",
                     &serde_json::to_string(&config_data)
                         .with_context(|| "Cound not serialise discovery light config into json")?,
@@ -319,7 +346,7 @@ pub(crate) async fn enable_discovery(
                 mqtt.send_message_with_root_topic(
                     &format!(
                         "{}/switch/{}",
-                        discovery_config.topic, &config_data.unique_id
+                        discovery_config.topic, config_data.unique_id
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
@@ -354,7 +381,7 @@ pub(crate) async fn enable_discovery(
                 mqtt.send_message_with_root_topic(
                     &format!(
                         "{}/camera/{}",
-                        discovery_config.topic, &config_data.unique_id
+                        discovery_config.topic, config_data.unique_id
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
@@ -393,7 +420,7 @@ pub(crate) async fn enable_discovery(
                 mqtt.send_message_with_root_topic(
                     &format!(
                         "{}/switch/{}",
-                        discovery_config.topic, &config_data.unique_id
+                        discovery_config.topic, config_data.unique_id
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
@@ -429,7 +456,7 @@ pub(crate) async fn enable_discovery(
                 mqtt.send_message_with_root_topic(
                     &format!(
                         "{}/select/{}",
-                        discovery_config.topic, &config_data.unique_id
+                        discovery_config.topic, config_data.unique_id
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
@@ -465,7 +492,7 @@ pub(crate) async fn enable_discovery(
                 mqtt.send_message_with_root_topic(
                     &format!(
                         "{}/binary_sensor/{}",
-                        discovery_config.topic, &config_data.unique_id
+                        discovery_config.topic, config_data.unique_id
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
@@ -500,7 +527,7 @@ pub(crate) async fn enable_discovery(
                 mqtt.send_message_with_root_topic(
                     &format!(
                         "{}/button/{}",
-                        discovery_config.topic, &config_data.unique_id
+                        discovery_config.topic, config_data.unique_id
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
@@ -536,7 +563,7 @@ pub(crate) async fn enable_discovery(
                     mqtt.send_message_with_root_topic(
                         &format!(
                             "{}/button/{}",
-                            discovery_config.topic, &config_data.unique_id
+                            discovery_config.topic, config_data.unique_id
                         ),
                         "config",
                         &serde_json::to_string(&config_data)
@@ -573,7 +600,7 @@ pub(crate) async fn enable_discovery(
                 mqtt.send_message_with_root_topic(
                     &format!(
                         "{}/sensor/{}",
-                        discovery_config.topic, &config_data.unique_id
+                        discovery_config.topic, config_data.unique_id
                     ),
                     "config",
                     &serde_json::to_string(&config_data).with_context(|| {
@@ -609,7 +636,7 @@ pub(crate) async fn enable_discovery(
                 mqtt.send_message_with_root_topic(
                     &format!(
                         "{}/button/{}",
-                        discovery_config.topic, &config_data.unique_id
+                        discovery_config.topic, config_data.unique_id
                     ),
                     "config",
                     &serde_json::to_string(&config_data)
@@ -634,4 +661,20 @@ pub(crate) async fn enable_discovery(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_entity_is_unavailable_when_its_camera_or_neolink_is_gone() {
+        let json = serde_json::to_value(availability("cam")).unwrap();
+        assert_eq!(json["availability_mode"], "all");
+        let topics = json["availability"].as_array().unwrap();
+        assert_eq!(topics[0]["topic"], "neolink/cam/status");
+        assert_eq!(topics[0]["payload_not_available"], "disconnected");
+        assert_eq!(topics[1]["topic"], "neolink/status");
+        assert_eq!(topics[1]["payload_not_available"], "offline");
+    }
 }

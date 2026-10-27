@@ -21,7 +21,7 @@ pub(crate) async fn stream_main(
         .mount_points()
         .ok_or(anyhow!("RTSP server lacks mount point"))?;
     // Create the factory
-    let (factory, thread) = make_factory(camera, stream).await?;
+    let (factory, thread) = make_factory(camera, stream, rtsp.clone()).await?;
 
     factory.add_permitted_roles(users);
 

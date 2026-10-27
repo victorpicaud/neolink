@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::net::{TcpSocket, TcpStream};
+use tokio::time::{timeout, Duration};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 pub(crate) struct TcpSource {
@@ -62,6 +63,15 @@ impl Sink<Bc> for TcpSource {
     }
 }
 
+/// How long a camera has to accept a connection. Left to the OS, a camera
+/// that is off held up the connection attempt for about two minutes.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connection may sit idle before TCP checks that the camera is
+/// still there, and how often it checks again. A camera that lost power
+/// without closing the connection was otherwise never noticed (#229).
+const KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Helper to create a TcpStream with a connect timeout
 async fn connect_to(addr: SocketAddr) -> Result<TcpStream> {
     let socket = match addr {
@@ -69,5 +79,35 @@ async fn connect_to(addr: SocketAddr) -> Result<TcpStream> {
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
 
-    Ok(socket.connect(addr).await?)
+    let stream = timeout(CONNECT_TIMEOUT, socket.connect(addr)).await??;
+    if let Err(e) = keep_alive(&stream) {
+        log::debug!("Could not set TCP keepalive: {e}");
+    }
+    Ok(stream)
+}
+
+fn keep_alive(stream: &TcpStream) -> std::io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new().with_time(KEEPALIVE_TIME);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+    ))]
+    let keepalive = keepalive.with_interval(KEEPALIVE_INTERVAL);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connections_keep_alive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = connect_to(listener.local_addr().unwrap()).await.unwrap();
+        assert!(socket2::SockRef::from(&stream).keepalive().unwrap());
+    }
 }

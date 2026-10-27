@@ -73,7 +73,8 @@ impl BcCamera {
                     Option::<Bc>::None
                 })
             })
-            .await?;
+            .await?
+            .forever();
         Ok(())
     }
 

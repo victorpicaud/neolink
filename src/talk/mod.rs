@@ -13,6 +13,8 @@
 ///
 use anyhow::{anyhow, Context, Result};
 use neolink_core::bc::xml::TalkConfig;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod cmdline;
 mod gst;
@@ -38,10 +40,16 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         .await
         .with_context(|| format!("Camera {} does not support talk", name))?;
 
-    if talk_ability.duplex_list.is_empty()
-        || talk_ability.audio_stream_mode_list.is_empty()
-        || talk_ability.audio_config_list.is_empty()
-    {
+    // Some cameras offer several modes; the first is what used to be the only one
+    let audio_stream_mode = talk_ability
+        .audio_stream_mode_list
+        .first()
+        .and_then(|modes| modes.audio_stream_mode.first())
+        .cloned();
+    let Some(audio_stream_mode) = audio_stream_mode else {
+        return Err(anyhow!("Camera {} does not support talk", name));
+    };
+    if talk_ability.duplex_list.is_empty() || talk_ability.audio_config_list.is_empty() {
         return Err(anyhow!("Camera {} does not support talk", name));
     }
 
@@ -52,9 +60,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
     let talk_config = TalkConfig {
         channel_id: config.channel_id,
         duplex: talk_ability.duplex_list[config_id].duplex.clone(),
-        audio_stream_mode: talk_ability.audio_stream_mode_list[config_id]
-            .audio_stream_mode
-            .clone(),
+        audio_stream_mode,
         audio_config: talk_ability.audio_config_list[config_id]
             .audio_config
             .clone(),
@@ -70,36 +76,42 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         ));
     }
 
-    let (mut set, rx) = match (&opt.file_path, &opt.microphone) {
-        (Some(path), false) => gst::from_input(
-            &format!(
-                "filesrc location={}",
-                path.to_str().expect("File path not UTF8 complient")
-            ),
+    // The command line asks for one or the other
+    let (mut set, rx) = match &opt.file_path {
+        Some(path) => gst::from_input(gst::Input::File(path), opt.volume, block_size, sample_rate)
+            .with_context(|| format!("Failed to setup gst with the file: {:?}", path))?,
+        None => gst::from_input(
+            gst::Input::Source(&opt.input_src),
             opt.volume,
             block_size,
             sample_rate,
         )
-        .with_context(|| format!("Failed to setup gst with the file: {:?}", path))?,
-        (None, true) => gst::from_input(&opt.input_src, opt.volume, block_size, sample_rate)
-            .context("Failed to setup gst using the microphone")?,
-        _ => unreachable!(),
+        .context("Failed to setup gst using the microphone")?,
     };
 
-    camera
+    // Shared with each try of the task, should the camera reconnect
+    let rx = Arc::new(Mutex::new(rx));
+    let talked = camera
         .run_task(|cam| {
             let rx = rx.clone();
             let talk_config = talk_config.clone();
             Box::pin(async move {
-                cam.talk_stream(rx, talk_config).await?;
+                cam.talk_stream(&mut *rx.lock().await, talk_config).await?;
                 Ok(())
             })
         })
         .await
-        .context("Talk stream ended early")?;
+        .context("Talk stream ended early");
 
+    // The pipeline ends once talk takes no more of its sound
     drop(rx);
-    while set.join_next().await.is_some() {}
-
-    Ok(())
+    let mut played = Ok(());
+    while let Some(ended) = set.join_next().await {
+        match ended {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => played = Err(e.context("Could not play the sound")),
+            Err(e) => played = Err(anyhow!(e).context("Could not play the sound")),
+        }
+    }
+    talked.and(played)
 }

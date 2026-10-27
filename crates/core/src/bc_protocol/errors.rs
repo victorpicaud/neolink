@@ -56,9 +56,13 @@ pub enum Error {
         code: u16,
     },
 
-    /// Raised when the camera responds with a status code over than OK during login
-    #[error("Camera responded with Err during login")]
-    CameraLoginFail,
+    /// Raised when the camera refuses the login: wrong credentials, or an
+    /// account it locked
+    #[error("The camera refused the login with code {code}")]
+    CameraLoginFail {
+        /// The camera's response code
+        code: u16,
+    },
 
     /// Raised when a connection is dropped.
     #[error("Dropped connection")]
@@ -169,6 +173,22 @@ pub enum Error {
     /// Raised when the subscription id dropped too soon
     #[error("Dropped Subscriber")]
     DroppedSubscriber,
+
+    /// Raised when the camera sends less of a snapshot than it announced
+    #[error("The camera sent {received} bytes of a {expected} byte snapshot")]
+    SnapshotTruncated {
+        /// The size the camera announced
+        expected: usize,
+        /// The bytes that arrived
+        received: usize,
+    },
+
+    /// Raised when a subscriber fell so far behind that its queue filled up
+    #[error("Subscription to message {msg_id} fell behind and was ended")]
+    SubscriptionOverflow {
+        /// The message ID subscribed to
+        msg_id: u32,
+    },
 
     /// Raised when a unknown connection ID attempts to connect with us over UDP
     #[error("Connection with unknown connectionID: {0:?}")]
@@ -288,10 +308,49 @@ impl From<tokio::time::error::Elapsed> for Error {
 impl<'a> From<nom::Err<NomErrorType<'a>>> for Error {
     fn from(k: nom::Err<NomErrorType<'a>>) -> Self {
         match k {
-            nom::Err::Error(e) => Error::NomError(format!("Nom Error: {:X?}", e)),
-            nom::Err::Failure(e) => Error::NomError(format!("Nom Error: {:X?}", e)),
+            nom::Err::Error(e) | nom::Err::Failure(e) => {
+                Error::NomError(format!("Nom Error: {}", describe_nom_error(&e)))
+            }
             nom::Err::Incomplete(nom::Needed::Size(amount)) => Error::NomIncomplete(amount.get()),
             nom::Err::Incomplete(nom::Needed::Unknown) => Error::NomIncomplete(1),
         }
+    }
+}
+
+/// Describes a parse error without its input: each position the error passed
+/// through held the rest of the buffer, which can be a whole media packet, and
+/// the text used to include all of it in hex.
+fn describe_nom_error(e: &NomErrorType) -> String {
+    const SHOWN: usize = 16;
+    e.errors
+        .iter()
+        .map(|(input, kind)| {
+            let more = if input.len() > SHOWN { " ..." } else { "" };
+            format!(
+                "{kind:?} at {:02X?}{more} ({} bytes)",
+                &input[..input.len().min(SHOWN)],
+                input.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_parse_error_does_not_copy_its_input() {
+        let input = vec![0xab; 1024 * 1024];
+        let e: nom::Err<NomErrorType> = nom::Err::Error(nom::error::VerboseError {
+            errors: vec![(
+                &input[..],
+                nom::error::VerboseErrorKind::Context("Magic invalid"),
+            )],
+        });
+        let text = Error::from(e).to_string();
+        assert!(text.len() < 300, "{} bytes: {text}", text.len());
+        assert!(text.contains("Magic invalid"), "{text}");
     }
 }

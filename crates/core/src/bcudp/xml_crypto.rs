@@ -5,13 +5,20 @@ const XML_KEY: [u32; 8] = [
 pub(crate) fn decrypt(offset: u32, buf: &[u8]) -> Vec<u8> {
     let key = XML_KEY
         .iter()
-        .flat_map(|i| (i + offset).to_le_bytes())
+        .flat_map(|i| i.wrapping_add(offset).to_le_bytes())
         .cycle();
     buf.iter().zip(key).map(|(byte, key)| key ^ byte).collect()
 }
 
 pub(crate) fn encrypt(offset: u32, buf: &[u8]) -> Vec<u8> {
     decrypt(offset, buf)
+}
+
+#[test]
+fn a_large_offset_wraps_instead_of_overflowing() {
+    // The offset is the transaction id, which comes off the wire
+    let data = b"<xml/>";
+    assert_eq!(decrypt(u32::MAX, &encrypt(u32::MAX, data)), data);
 }
 
 #[test]

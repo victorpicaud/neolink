@@ -1,1 +1,14 @@
 Cargo.lock binary
+
+# Protocol capture samples used by the unit tests. Some contain XML text, so
+# without this a Windows checkout with core.autocrlf=true rewrites their line
+# endings and the byte-exact crypto tests fail.
+*.bin binary
+*.raw binary
+*.pcapng binary
+*.h264 binary
+
+# Scripts run inside Linux (WSL, containers, CI) must keep LF endings even in
+# a Windows checkout, or the shebang line breaks.
+*.sh text eol=lf
+*.py text eol=lf

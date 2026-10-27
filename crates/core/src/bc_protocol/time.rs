@@ -178,7 +178,22 @@ fn try_build_timestamp(
             .with_second(second)
             .ok_or(Error::TimeParse)?,
     )?;
-    let offset = UtcOffset::from_whole_seconds(timezone)?;
+    // Reolink counts seconds west of UTC, as `set_time` sends them: read the
+    // other way round, a camera's time was off by twice its UTC offset
+    let offset = UtcOffset::from_whole_seconds(timezone.checked_neg().ok_or(Error::TimeParse)?)?;
 
     Ok(PrimitiveDateTime::new(date, time).assume_offset(offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_camera_east_of_utc_says_so_with_a_negative_time_zone() {
+        // 10:00 at UTC+1 is 09:00 UTC
+        let time = try_build_timestamp(-3600, 2026, 1, 1, 10, 0, 0).unwrap();
+        assert_eq!(time.offset().whole_seconds(), 3600);
+        assert_eq!(time.to_offset(UtcOffset::UTC).hour(), 9);
+    }
 }

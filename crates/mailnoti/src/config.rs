@@ -1,11 +1,11 @@
 use neolink_core::bc_protocol::DiscoveryMethods;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use std::clone::Clone;
+use std::sync::LazyLock;
 use validator::{Validate, ValidationError};
 
-static RE_MAXENC_SRC: Lazy<Regex> = Lazy::new(|| {
+static RE_MAXENC_SRC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^([nN]one|[Aa][Ee][Ss]|[Bb][Cc][Ee][Nn][Cc][Rr][Yy][Pp][Tt])$").unwrap()
 });
 

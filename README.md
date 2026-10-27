@@ -176,6 +176,9 @@ bind = "0.0.0.0"
 broker_addr = "127.0.0.1" # Address of the mqtt server
 port = 1883 # mqtt servers port
 credentials = ["username", "password"] # mqtt server login details
+# client_id = "neolink" # What neolink calls itself to the broker. By default,
+#                       # one made from the host, the config file and the
+#                       # RTSP port, the same every time
 
 [[cameras]]
 name = "Camera01"
@@ -183,6 +186,9 @@ username = "admin"
 password = "password"
 uid = "ABCDEF0123456789"
 ```
+
+A `ca` or `client_auth` file that cannot be read stops neolink from
+connecting, rather than connecting without TLS. `client_auth` needs a `ca`.
 
 Then to start the mqtt+rtsp connection run the following:
 
@@ -196,14 +202,19 @@ OR for only mqtt
 ./neolink mqtt --config=neolink.toml
 ```
 
+Neolink connects to the broker again for as long as it takes, and then
+publishes again what it keeps there, so that a broker that restarted, and
+forgot everything, has it again.
+
 Neolink will publish these messages:
 
 Messages that are prefixed with `neolink/`
 
 - `/status` Tracks the connection of neolink, `connected` for ready `offline`
-  for not ready this is a LastWill message
-- `/config` The configuration file used to start neolink, you can publish to
-  this to **temporarily** alter the live configuration
+  for not ready this is a LastWill message, and what neolink says as it stops
+- `/config` The configuration neolink runs with, without its passwords, you
+  can publish to this to **temporarily** alter the live configuration (see
+  [Controlling RTSP from MQTT](#controlling-rtsp-from-mqtt))
 - `/config/status` If you publish to `/config` then any errors from your
   publish config will show here, or `Ok(())` if no errors and finished loading
 
@@ -228,13 +239,14 @@ Control messages:
 - `/control/floodlight_tasks [on|off]` Turns floodlight (if equipped) tasks on/off
   This is the automatic tasks such as on motion and night triggers
 - `/control/wakeup (mins)` For cameras that are using `idle_disconnect` this will
-  force a wakeup for at least the given minutes
+  force a wakeup for at least the given minutes, a day at most
 - `/control/siren on` Signal the siren, the message is always "on" as there is no
   "off" signal for the siren
 
 Status Messages:
 
-- `/status disconnected` Sent when the camera goes offline
+- `/status disconnected` Sent when the camera goes offline, and `connected`
+  when it is back
 - `/status/battery` Sent in reply to a `/query/battery` an XML encoded version
   of the battery status
 - `/status/battery_level` A simple % value of current battery level, only
@@ -267,6 +279,15 @@ to control the RTSP
 
 Changes made to the config by publishing to `/neolink/config` should be
 reflected in the rtsp
+
+Only a config published while neolink is connected is applied. One the broker
+kept from before, such as neolink's own from its last run, is ignored: the
+config file is what neolink starts with.
+
+The config neolink publishes has no passwords. A config sent without one
+keeps the current one, but only for the same camera `address` and `uid`, and
+the same broker: anyone who can publish to the broker could otherwise send a
+password to a host of theirs.
 
 These include changing the:
 
@@ -374,6 +395,9 @@ Available features are:
 - `battery`: This adds a battery level sensor to home assistant
 - `siren`: Adds a siren button to home assistant
 
+The entities are unavailable in home assistant while their camera is
+disconnected, or neolink is offline.
+
 ### Extra Camera Settings
 
 Listed below are extra camera settings:
@@ -388,6 +412,8 @@ debug = false # Displays Debug XML messages from camera
 enabled = true # Enable or Disable the camera
 update_time = false # When camera connects, force the setting of the camera date/time to now. The default is false
 print_format = "None"  # Type of format that logs are displayed in (None, Human, Xml). The default is None
+max_reconnect_backoff = 60 # The longest wait between two tries to connect to the camera, in seconds. The default is 60
+push_notifications = false # Ask the camera for push notifications. The default is false
 ```
 
 - **Debug:** Will dump the various XMLs from the camera as they are recieved
@@ -404,6 +430,13 @@ ssue a user had)
 - **print_format:** Used for adjusting printing of some values mostly, battery
 messages
 
+- **max_reconnect_backoff:** neolink tries to connect to a camera again after
+about 1s, then waits about twice as long each time, up to this. A camera that
+refuses the login is tried again every 5 minutes.
+
+- **push_notifications:** Off by default: Google no longer takes the
+registration that push notifications need.
+
 ### Pause
 
 To use the pause feature you will need to adjust your config file as such:
@@ -418,8 +451,7 @@ password = "password"
 uid = "ABCDEF0123456789"
   [cameras.pause]
   on_motion = true # Should pause when no motion
-  on_client = true # Should pause when no rtsp client
-  timeout = 2.1 # How long to wait after motion stops before pausing
+  motion_timeout = 2.1 # How long to wait after motion stops before pausing, in seconds
 ```
 
 Then start the rtsp server as usual:
@@ -427,6 +459,12 @@ Then start the rtsp server as usual:
 ```bash
 ./neolink rtsp --config=neolink.toml
 ```
+
+While paused, clients keep their last picture. A client that connects while
+the stream is paused still gets frames until it has a picture.
+
+A stream always stops 10s after its last client leaves, as `on_client = true`
+asked for: `on_client = false` is ignored, with a warning. So is `mode`.
 
 ### Idle Disconnects
 
@@ -469,11 +507,14 @@ You can make neolink stop active streams when there are no rtsp clients using
 Once in the disconnected state. Neolink will stay disconnected until there is a
 new requested activation such as a client connecting or an mqtt command
 
-~Neolink will also wake up on push notifications from the camera. These are usually
-sent by the camera on motion or PIR alarms. To disable this you can set
-`push_notifications = false` in the `[[cameras]]` config~
+Push notifications, which used to wake neolink on motion, are off by
+default, since Google removed the APIs we were using for them.
+`push_notifications = true` in the `[[cameras]]` config tries anyway.
 
-[Google removed the apis we were using for push notifications]
+### Stopping
+
+Neolink stops cleanly on Ctrl+C or SIGTERM: it logs out of its cameras, tells
+the MQTT broker that it is offline, and exits. A second one stops it at once.
 
 ### Docker
 
@@ -494,12 +535,33 @@ docker pull quantumentangledandy/neolink
 docker run --network host --volume=$PWD/config.toml:/etc/neolink.toml quantumentangledandy/neolink
 ```
 
+The image is based on Debian trixie. `docker stop` stops neolink cleanly (see
+[Stopping](#stopping)), and the image's HEALTHCHECK runs
+[`neolink healthcheck`](#healthcheck).
+
 #### Environmental Variables
 
 There are currently 2 environmental variables available as part of the container:
 
 - `NEO_LINK_MODE`: defaults to `"rtsp"` if not set, other options are "mqtt" or "mqtt-rtsp".
-- `NEO_LINK_PORT`: defaults to `8554`, set this to your required port value.
+- `NEO_LINK_PORT`: defaults to `8554`. It only sets the port the image
+  declares: neolink serves RTSP on the config's `bind_port`, 8554 by default.
+
+### Healthcheck
+
+`neolink healthcheck` tells whether a running neolink still works, for a
+container's HEALTHCHECK or a liveness probe. It exits with 0 if it does, and 1
+if part of it froze, saying which.
+
+```bash
+neolink healthcheck [--timeout=10] [CameraName]
+```
+
+While neolink serves, neolink itself, its RTSP server and each camera refresh
+a heartbeat file every second, as long as they answer. They are in
+`neolink-health` in the temporary directory, or in `NEOLINK_HEALTH_DIR`. A
+camera that is away or asleep is still healthy: restarting neolink would not
+bring it back.
 
 ### Image
 

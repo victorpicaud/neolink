@@ -4,7 +4,7 @@
 //!
 //! The camera watch is used as an event to be triggered
 //! whenever the camera is lost/updated
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use futures::TryFutureExt;
 use std::sync::{Arc, Weak};
 use tokio::{
@@ -18,6 +18,19 @@ use tokio_util::sync::CancellationToken;
 use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
 use neolink_core::bc_protocol::BcCamera;
+
+/// The camera is going away for good: it was removed from the config, or
+/// neolink is stopping
+#[derive(Debug)]
+pub(crate) struct CameraGone;
+
+impl std::fmt::Display for CameraGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Camera is disconnecting")
+    }
+}
+
+impl std::error::Error for CameraGone {}
 
 #[cfg(feature = "gstreamer")]
 mod gst;
@@ -111,10 +124,10 @@ impl NeoInstance {
                 })
                 .map_ok(|new_cam| new_cam.upgrade())
                 .await
-                .with_context(|| "Camera is disconnecting")?;
+                .map_err(|_| CameraGone)?;
             break tokio::select! {
                 _ = self.cancel.cancelled() => {
-                    Err(anyhow!("Camera is disconnecting"))
+                    Err(CameraGone.into())
                 }
                 _ = camera_watch.wait_for(|new_cam| !Weak::ptr_eq(new_cam, &camera.as_ref().map(Arc::downgrade).unwrap_or_default())).map_ok(|new_cam| new_cam.upgrade()) => {
                     // Camera value has changed!
@@ -125,21 +138,31 @@ impl NeoInstance {
                     if let Some(cam) = camera.clone() {
                         let cam_ref = cam.as_ref();
                         let mut r = Err(anyhow!("No run"));
+                        let mut timeouts = 0;
                         for i in 0..5 {
                             r = task(cam_ref).await;
                             if let Err(e) = &r {
                                 log::debug!("- Task Error: {e:?}");
                             }
-                            if let Err(Some(e @ neolink_core::Error::CameraServiceUnavailable{code: 400, ..})) = r.as_ref().map_err(|e| e.downcast_ref::<neolink_core::Error>()) {
-                                // Retryable without a reconnect
-                                // Usually occurs when camera is starting up
-                                // or the connection is initialising
-                                log::debug!("Got a 400 code for {e:?} retry {i}/5, ");
+                            match r.as_ref().map_err(|e| e.downcast_ref::<neolink_core::Error>()) {
+                                Err(Some(e @ neolink_core::Error::CameraServiceUnavailable{code: 400, ..})) => {
+                                    // Retryable without a reconnect
+                                    // Usually occurs when camera is starting up
+                                    // or the connection is initialising
+                                    log::debug!("Got a 400 code for {e:?} retry {i}/5, ");
 
-                                sleep(Duration::from_secs(1)).await;
-                                continue;
-                            } else {
-                                break;
+                                    sleep(Duration::from_secs(1)).await;
+                                    continue;
+                                }
+                                // The reply did not come in time. Tried again,
+                                // once, on this connection: waiting for a new
+                                // one, as for a dropped connection, would wait
+                                // forever if this one is fine.
+                                Err(Some(neolink_core::Error::Timeout(_))) if timeouts < 1 => {
+                                    timeouts += 1;
+                                    continue;
+                                }
+                                _ => break,
                             }
                         }
                         r
@@ -258,6 +281,16 @@ impl NeoInstance {
         Ok(instance_rx.await?)
     }
 
+    /// Drops the connection to the camera, and connects again
+    #[cfg(feature = "gstreamer")]
+    pub(crate) async fn reconnect(&self) -> Result<()> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::Reconnect(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
     pub(crate) async fn disconnect(&self) -> Result<()> {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control
@@ -329,11 +362,9 @@ where
 {
     fn drop(&mut self) {
         if let (Some(command), Some(instance)) = (self.command.take(), self.instance.take()) {
-            let _gt = tokio::runtime::Handle::current().enter();
             let timeout = self.timeout;
-            tokio::task::spawn(async move {
-                tokio::time::timeout(timeout, instance.run_passive_task(*command)).await??;
-                crate::AnyResult::Ok(())
+            crate::utils::spawn_cleanup(async move {
+                let _ = tokio::time::timeout(timeout, instance.run_passive_task(*command)).await;
             });
         }
     }

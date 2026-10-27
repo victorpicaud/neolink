@@ -1,11 +1,15 @@
-name: Style
+name: Checks
 
 on: [push, pull_request]
+
+# The Rust toolchain (and its clippy/rustfmt components) is pinned by
+# rust-toolchain.toml; rustup installs it on first use.
 
 jobs:
   pre_job:
     # continue-on-error: true # Uncomment once integration is finished
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # Map a step output to a job output
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
@@ -22,48 +26,120 @@ jobs:
     if: needs.pre_job.outputs.should_skip != 'true'
     name: Clippy
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: apt install gstreamer and deps
+        timeout-minutes: 15
         run: |
-          sudo apt update
-          sudo apt install -y aptitude
-          sudo aptitude install -y libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler
-      - name: Install nightly rust
-        run: |
-          rustup toolchain install nightly --component clippy
-          rustup override set nightly
-      - name: Run clippy manually
+          sudo apt -o Acquire::Retries=3 update
+          sudo apt -o Acquire::Retries=3 install -y aptitude
+          sudo aptitude install -y --without-recommends libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev protobuf-compiler
+      - name: Run clippy
         run: |
           echo "All Features"
-          cargo +nightly clippy --workspace --all-targets --all-features || exit 1
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
           echo "No Features"
-          cargo +nightly clippy --workspace --all-targets --no-default-features || exit 1
+          cargo clippy --workspace --all-targets --no-default-features -- -D warnings
           echo "Gstreamer Only"
-          cargo +nightly clippy --workspace --all-targets --no-default-features --features=gstreamer || exit 1
+          cargo clippy --workspace --all-targets --no-default-features --features=gstreamer -- -D warnings
           echo "Pushnoti Only"
-          cargo +nightly clippy --workspace --all-targets --no-default-features --features=pushnoti || exit 1
+          cargo clippy --workspace --all-targets --no-default-features --features=pushnoti -- -D warnings
 
   check_fmt:
     needs: pre_job
     if: needs.pre_job.outputs.should_skip != 'true'
     name: Rust-fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Install nightly rust
-        run: |
-          rustup toolchain install nightly --component rustfmt
-          rustup override set nightly
       - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  test:
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    name: Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt install gstreamer and deps
+        timeout-minutes: 15
         run: |
-          cargo +nightly fmt --all -- --check
+          sudo apt -o Acquire::Retries=3 update
+          sudo apt -o Acquire::Retries=3 install -y --no-install-recommends \
+            libgstrtspserver-1.0-dev libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-x \
+            protobuf-compiler libssl-dev ffmpeg mosquitto mosquitto-clients
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
+      - name: Test (no default features)
+        run: cargo test --workspace --no-default-features
+      - name: Test fake camera
+        run: cargo test --manifest-path iso-test/sim/fakecam/Cargo.toml
+      - name: End-to-end smoke test (neolink rtsp <- fake camera)
+        run: bash iso-test/sim/smoke.sh
+      - name: End-to-end stuck camera test
+        run: bash iso-test/sim/stuck-camera.sh
+      - name: End-to-end shared stream test
+        run: bash iso-test/sim/shared-stream.sh
+      - name: End-to-end stream timing test
+        run: bash iso-test/sim/stream-timing.sh
+      - name: End-to-end stalled stream test
+        run: bash iso-test/sim/stalled-stream.sh
+      - name: End-to-end config reload test (over MQTT)
+        run: bash iso-test/sim/config-reload.sh
+      - name: End-to-end MQTT burst test
+        run: bash iso-test/sim/mqtt-burst.sh
+      - name: End-to-end login test
+        run: bash iso-test/sim/login.sh
+      - name: End-to-end liveness test
+        run: bash iso-test/sim/liveness.sh
+      - name: End-to-end camera time test
+        run: bash iso-test/sim/camera-time.sh
+      - name: End-to-end motion test (over MQTT)
+        run: bash iso-test/sim/motion.sh
+      - name: End-to-end MQTT broker test
+        run: bash iso-test/sim/mqtt-broker.sh
+      - name: End-to-end shutdown test
+        run: bash iso-test/sim/shutdown.sh
+      - name: End-to-end healthcheck test
+        run: bash iso-test/sim/healthcheck.sh
+      - name: End-to-end talk test
+        run: bash iso-test/sim/talk.sh
+
+  check_deny:
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny
+        run: cargo deny --workspace --all-features check
 
   check_lua:
     needs: pre_job
     if: needs.pre_job.outputs.should_skip != 'true'
     name: Luacheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Run luacheck

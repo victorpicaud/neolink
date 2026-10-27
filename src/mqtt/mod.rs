@@ -959,7 +959,7 @@ async fn handle_mqtt_message(
                 "OK"
             }
             .to_string();
-            mqtt.send_message("control/ir", &reply, false)
+            mqtt.send_message("control/reboot", &reply, false)
                 .await
                 .with_context(|| "Failed to publish reboot on the camera")?;
         }
@@ -1095,7 +1095,7 @@ async fn handle_mqtt_message(
                 "FAIL"
             }
             .to_string();
-            mqtt.send_message("control/ir", &reply, false)
+            mqtt.send_message("control/ptz/preset", &reply, false)
                 .await
                 .with_context(|| "Failed to publish ptz move")?;
         }
@@ -1134,7 +1134,7 @@ async fn handle_mqtt_message(
                 "FAIL"
             }
             .to_string();
-            mqtt.send_message("control/ir", &reply, false)
+            mqtt.send_message("control/ptz/assign", &reply, false)
                 .await
                 .with_context(|| "Failed to publish ptz move")?;
         }

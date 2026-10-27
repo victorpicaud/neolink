@@ -471,18 +471,30 @@ pub struct RfAlarmCfg {
     pub rf_id: Option<u8>,
     /// PIR status
     pub enable: u8,
-    /// PIR sensitivity
-    pub sensitivity: u8,
+    /// PIR sensitivity. Some cameras, such as the Argus B740X, leave it out,
+    /// like the schedule and the alarm handle: their PIR could then be
+    /// neither read nor switched. Each is left out when the config is sent
+    /// back too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<u8>,
     /// PIR sensivalue
     pub sensiValue: u8,
     /// reduce False alarm boolean
     pub reduceFalseAlarm: u8,
     /// XML time block for all week days
-    #[serde(rename = "timeBlockList")]
-    pub time_block_list: TimeBlockList,
+    #[serde(
+        default,
+        rename = "timeBlockList",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub time_block_list: Option<TimeBlockList>,
     /// The alarm handle to attach to this Rf
-    #[serde(rename = "alarmHandle")]
-    pub alarm_handle: AlarmHandle,
+    #[serde(
+        default,
+        rename = "alarmHandle",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alarm_handle: Option<AlarmHandle>,
 }
 
 /// TimeBlockList XML
@@ -2059,4 +2071,29 @@ fn a_pir_config_without_an_rf_id_parses_and_is_sent_back_without_one() {
     assert_eq!(xml.rf_alarm_cfg.as_ref().unwrap().rf_id, None);
     let sent = String::from_utf8(xml.serialize(vec![]).unwrap()).unwrap();
     assert!(!sent.contains("rfID"), "{sent}");
+}
+
+#[test]
+fn a_pir_config_without_sensitivity_schedule_or_alarm_handle_parses() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    // As an Argus B740X sends it
+    let sample = indoc!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <rfAlarmCfg version="1.1">
+        <enable>1</enable>
+        <sensiValue>16</sensiValue>
+        <reduceFalseAlarm>0</reduceFalseAlarm>
+        </rfAlarmCfg>
+        </body>
+        "#
+    );
+    let xml = BcXml::try_parse(sample.as_bytes()).unwrap();
+    let pir = xml.rf_alarm_cfg.as_ref().unwrap();
+    assert_eq!((pir.enable, pir.sensiValue), (1, 16));
+    // Sent back as it came
+    let sent = String::from_utf8(xml.serialize(vec![]).unwrap()).unwrap();
+    for left_out in ["sensitivity", "timeBlockList", "alarmHandle"] {
+        assert!(!sent.contains(left_out), "{sent}");
+    }
 }

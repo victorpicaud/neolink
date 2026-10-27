@@ -246,7 +246,9 @@ Control messages:
 Status Messages:
 
 - `/status disconnected` Sent when the camera goes offline, and `connected`
-  when it is back
+  when it is back. With `idle_disconnect`, `sleeping` while neolink lets the
+  camera sleep until something needs it: a sleeping camera wakes for any
+  command. One that does not wake within a minute is `disconnected`.
 - `/status/battery` Sent in reply to a `/query/battery` an XML encoded version
   of the battery status
 - `/status/battery_level` A simple % value of current battery level, only
@@ -396,7 +398,8 @@ Available features are:
 - `siren`: Adds a siren button to home assistant
 
 The entities are unavailable in home assistant while their camera is
-disconnected, or neolink is offline.
+disconnected, or neolink is offline. Those of a sleeping camera stay
+available: using one wakes the camera.
 
 ### Extra Camera Settings
 

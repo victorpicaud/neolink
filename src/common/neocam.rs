@@ -41,6 +41,8 @@ pub(crate) enum NeoCamCommand {
     Disconnect(OneshotSender<()>),
     Connect(OneshotSender<()>),
     State(OneshotSender<NeoCamThreadState>),
+    /// Whether neolink wants the camera connected, as it changes
+    StateWatch(OneshotSender<WatchReceiver<NeoCamThreadState>>),
     GetPermit(OneshotSender<Permit>),
     #[cfg(feature = "pushnoti")]
     PushNoti(OneshotSender<WatchReceiver<Option<PushNoti>>>),
@@ -144,6 +146,9 @@ impl NeoCam {
                             }
                             NeoCamCommand::State(sender) => {
                                 let _ = sender.send(*state_tx.borrow());
+                            }
+                            NeoCamCommand::StateWatch(sender) => {
+                                let _ = sender.send(state_tx.subscribe());
                             }
                             NeoCamCommand::Reconnect(sender) => {
                                 reconnect_tx.send_modify(|requests| *requests += 1);

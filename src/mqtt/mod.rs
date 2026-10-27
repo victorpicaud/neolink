@@ -22,6 +22,7 @@
 //!
 //! `/status offline` Sent when the neolink goes offline this is a LastWill message
 //! `/status disconnected` Sent when the camera goes offline
+//! `/status sleeping` Sent when neolink lets the camera sleep, with `idle_disconnect`
 //! `/status/battery` Sent in reply to a `/query/battery`
 //! `/status/pir` Sent in reply to a `/query/pir`
 //! `/status/ptz/preset` Sent in reply to a `/query/ptz/preset`
@@ -67,7 +68,7 @@ use std::{
 use tokio::{
     sync::mpsc::channel as mpsc,
     task::JoinSet,
-    time::{interval, sleep, timeout, Duration, MissedTickBehavior},
+    time::{interval, sleep, sleep_until, timeout, Duration, Instant, MissedTickBehavior},
 };
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -80,7 +81,7 @@ mod discovery;
 mod mqttc;
 
 use crate::{
-    common::{supervise_cameras, MdState, NeoInstance, NeoReactor},
+    common::{supervise_cameras, MdState, NeoCamThreadState, NeoInstance, NeoReactor},
     config::Config,
     AnyResult,
 };
@@ -354,6 +355,7 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                 let mut set_msg = JoinSet::new();
 
                 let mut camera_watch = camera.camera();
+                let camera_wanted = camera.clone();
                 let mqtt_watch = mqtt_instance.resubscribe().await?;
 
                 let camera_floodlight = camera.clone();
@@ -417,20 +419,46 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     } => v,
                     // Handle camera disconnect/connect
                     v = async {
+                        let mut wanted = camera_wanted.wanted_state().await?;
+                        // As published above
+                        let mut presence = Presence::Disconnected;
+                        let mut waking_since = None;
                         loop {
-                            camera_watch.wait_for(|cam| cam.upgrade().is_some()).await.with_context(|| {
-                                format!("{}: Online Watch Dropped", camera_name)
-                            })?;
-                            log::trace!("Publish online");
-                            mqtt_watch.send_message("status", "connected", true).await.with_context(|| {
-                                format!("{}: Failed to publish connected", camera_name)
-                            })?;
-                            camera_watch.wait_for(|cam| cam.upgrade().is_none()).await.with_context(|| {
-                                format!("{}: Disconnect Watch Dropped", camera_name)
-                            })?;
-                            mqtt_watch.send_message("status", "disconnected", true).await.with_context(|| {
-                                format!("{}: Failed to publish disconnected", camera_name)
-                            })?;
+                            let connected = camera_watch.borrow_and_update().upgrade().is_some();
+                            let wants = matches!(*wanted.borrow_and_update(), NeoCamThreadState::Connected);
+                            let waking_for = if !connected && wants {
+                                waking_since.get_or_insert_with(Instant::now).elapsed()
+                            } else {
+                                waking_since = None;
+                                Duration::ZERO
+                            };
+                            let next = presence.next(connected, wants, waking_for);
+                            if next != presence {
+                                log::trace!("Publish {}", next.as_str());
+                                mqtt_watch.send_message("status", next.as_str(), true).await.with_context(|| {
+                                    format!("{}: Failed to publish {}", camera_name, next.as_str())
+                                })?;
+                                presence = next;
+                            }
+                            // A sleeping camera that does not wake in time is gone
+                            let woken_by = match (presence, waking_since) {
+                                (Presence::Sleeping, Some(since)) => Some(since + Presence::WAKE_TIME),
+                                _ => None,
+                            };
+                            tokio::select! {
+                                v = camera_watch.changed() => v.with_context(|| {
+                                    format!("{}: Online Watch Dropped", camera_name)
+                                })?,
+                                v = wanted.changed() => v.with_context(|| {
+                                    format!("{}: State Watch Dropped", camera_name)
+                                })?,
+                                _ = async {
+                                    match woken_by {
+                                        Some(at) => sleep_until(at).await,
+                                        None => futures::future::pending().await,
+                                    }
+                                } => {}
+                            }
                         }
                     } => {
                         v
@@ -638,6 +666,47 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
     drop(drop_cancel);
     r?;
     Ok(())
+}
+
+/// What neolink says of a camera on `neolink/{CAMERANAME}/status`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    Connected,
+    /// Let go of on purpose, as a battery camera that nothing needs, with
+    /// `idle_disconnect`. Asked to do anything, it wakes, so Home Assistant
+    /// keeps its controls: it used to say disconnected, and they were
+    /// unavailable for as long as the camera slept.
+    Sleeping,
+    /// Lost while needed, or did not wake in time
+    Disconnected,
+}
+
+impl Presence {
+    /// How long a sleeping camera may take to wake, before it counts as gone
+    const WAKE_TIME: Duration = Duration::from_secs(60);
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Sleeping => "sleeping",
+            Self::Disconnected => "disconnected",
+        }
+    }
+
+    /// What comes after `self`, from whether the camera is connected, whether
+    /// neolink wants it to be, and how long it has wanted it
+    fn next(self, connected: bool, wanted: bool, waking_for: Duration) -> Self {
+        match (connected, wanted) {
+            (true, _) => Self::Connected,
+            // One that could not be reached too: it may well wake next time,
+            // and Home Assistant would not ask it to while it is unavailable
+            (false, false) => Self::Sleeping,
+            (false, true) if self == Self::Sleeping && waking_for < Self::WAKE_TIME => {
+                Self::Sleeping
+            }
+            (false, true) => Self::Disconnected,
+        }
+    }
 }
 
 /// Whether the camera does not support a request, or answers it in a way that
@@ -1455,5 +1524,28 @@ mod tests {
 
         let broker_elsewhere = from_mqtt("elsewhere");
         assert_eq!(broker_elsewhere.mqtt.unwrap().credentials, None);
+    }
+
+    #[test]
+    fn a_camera_let_go_of_sleeps_and_one_that_does_not_wake_is_disconnected() {
+        use Presence::*;
+        let now = Duration::ZERO;
+        let soon = Duration::from_secs(5);
+        assert_eq!(Disconnected.next(true, true, now), Connected);
+        assert_eq!(Connected.next(false, false, now), Sleeping, "let go of");
+        assert_eq!(Connected.next(false, true, now), Disconnected, "lost");
+        assert_eq!(Sleeping.next(false, true, soon), Sleeping, "waking");
+        assert_eq!(Sleeping.next(true, true, soon), Connected);
+        assert_eq!(
+            Sleeping.next(false, true, Presence::WAKE_TIME),
+            Disconnected,
+            "did not wake"
+        );
+        assert_eq!(Disconnected.next(false, true, soon), Disconnected);
+        assert_eq!(
+            Disconnected.next(false, false, now),
+            Sleeping,
+            "no longer needed"
+        );
     }
 }

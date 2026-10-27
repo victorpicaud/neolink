@@ -67,11 +67,15 @@ struct DiscoveryAvaliablity {
     payload_available: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload_not_available: Option<String>,
+    /// What of the message Home Assistant compares with the payloads
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_template: Option<String>,
 }
 
 /// An entity is available while both its camera and neolink are connected.
 /// Home Assistant took neither for gone: it waits for "offline" by default,
-/// which a camera never says, and neolink's own status was not watched.
+/// which a camera never says, and neolink's own status was not watched. A
+/// sleeping camera counts as connected: it wakes for its controls.
 #[derive(Serialize, Debug, Clone)]
 struct Availability {
     availability: Vec<DiscoveryAvaliablity>,
@@ -221,11 +225,15 @@ fn availability(camera: &str) -> Availability {
                 topic: format!("neolink/{camera}/status"),
                 payload_available: Some("connected".to_string()),
                 payload_not_available: Some("disconnected".to_string()),
+                value_template: Some(
+                    "{{ 'disconnected' if value == 'disconnected' else 'connected' }}".to_string(),
+                ),
             },
             DiscoveryAvaliablity {
                 topic: "neolink/status".to_string(),
                 payload_available: Some("connected".to_string()),
                 payload_not_available: Some("offline".to_string()),
+                value_template: None,
             },
         ],
         availability_mode: "all".to_string(),
@@ -674,6 +682,11 @@ mod tests {
         let topics = json["availability"].as_array().unwrap();
         assert_eq!(topics[0]["topic"], "neolink/cam/status");
         assert_eq!(topics[0]["payload_not_available"], "disconnected");
+        // Sleeping included
+        assert_eq!(
+            topics[0]["value_template"],
+            "{{ 'disconnected' if value == 'disconnected' else 'connected' }}"
+        );
         assert_eq!(topics[1]["topic"], "neolink/status");
         assert_eq!(topics[1]["payload_not_available"], "offline");
     }

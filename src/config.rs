@@ -294,6 +294,13 @@ pub(crate) struct MqttConfig {
 
     #[serde(default)]
     pub(crate) discovery: Option<MqttDiscoveryConfig>,
+
+    /// What speaks the text sent to `control/say`: a command that reads it on
+    /// its standard input, and writes the sound to its standard output. Only
+    /// ever from the config file: anyone who can publish a config over MQTT
+    /// could otherwise have neolink run what they like.
+    #[serde(default, skip_serializing)]
+    pub(crate) say_command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
@@ -332,6 +339,7 @@ fn default_mqtt() -> MqttConfig {
         enable_floodlight: true,
         floodlight_update: 2000,
         discovery: Default::default(),
+        say_command: None,
     }
 }
 

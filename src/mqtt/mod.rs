@@ -17,6 +17,8 @@
 //! - `/control/ptz` [up|down|left|right|in|out] (amount) Control the PTZ movements, amount defaults to 32.0
 //! - `/control/ptz/preset` [id] Move the camera to a known preset
 //! - `/control/ptz/assign` [id] [name] Assign the current ptz position to an ID and name
+//! - `/control/say` [text] Speaks the text through the camera, with the `say_command` of its config
+//! - `/control/talk` [url] Plays the sound file at an http or https URL through the camera
 //!
 //! Status Messages:
 //!
@@ -79,6 +81,7 @@ use neolink_core::bc_protocol::{Direction as BcDirection, LightState};
 mod cmdline;
 mod discovery;
 mod mqttc;
+mod speaker;
 
 use crate::{
     common::{supervise_cameras, MdState, NeoCamThreadState, NeoInstance, NeoReactor},
@@ -95,6 +98,7 @@ use mqttc::{Mqtt, MqttReplyRef};
 use self::{
     discovery::enable_discovery,
     mqttc::{MqttInstance, MqttReply},
+    speaker::Speaker,
 };
 
 /// Entry point for the mqtt subcommand
@@ -194,6 +198,7 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor, stop: CancellationToken) -
                         let mut config = config?;
 
                         fill_in_passwords(&mut config, &curr_config);
+                        keep_say_commands(&mut config, &curr_config);
 
                         let validate = config.validate().with_context(|| {
                             format!("Failed to validate the MQTT {:?} config file", msg.topic)
@@ -315,6 +320,26 @@ fn fill_in_passwords(config: &mut Config, current: &Config) {
     }
 }
 
+/// Keeps the say commands of `current`. Neolink does not publish them, so a
+/// config sent over MQTT leaves them out, and one sent with them would have
+/// neolink run what whoever can publish to the broker likes.
+fn keep_say_commands(config: &mut Config, current: &Config) {
+    for cam in config.cameras.iter_mut() {
+        cam.mqtt.say_command = current
+            .cameras
+            .iter()
+            .find(|c| c.name == cam.name)
+            .and_then(|c| c.mqtt.say_command.clone());
+    }
+}
+
+/// Whether `url` is an http or an https one
+fn is_web_url(url: &str) -> bool {
+    let url = url.to_ascii_lowercase();
+    (url.starts_with("http://") || url.starts_with("https://"))
+        && !url.contains(char::is_whitespace)
+}
+
 async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> Result<()> {
     let mut watch_config = camera.config().await?;
     let camera_name = watch_config.borrow().name.clone();
@@ -353,6 +378,7 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                 let mut mqtt_msg = mqtt_instance.resubscribe().await?;
                 let cancel_msg = cancel.clone();
                 let mut set_msg = JoinSet::new();
+                let speaker = Arc::new(Speaker::new());
 
                 let mut camera_watch = camera.camera();
                 let camera_wanted = camera.clone();
@@ -391,11 +417,12 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                     let camera_msg = camera_msg.clone();
                                     let tx = tx.clone();
                                     let cancel_msg = cancel_msg.clone();
+                                    let speaker = speaker.clone();
                                     set_msg.spawn(async move {
                                         tokio::select!{
                                             _ = cancel_msg.cancelled() => AnyResult::Ok(()),
                                             v = async {
-                                                let res = handle_mqtt_message(msg, &mqtt_msg, &camera_msg).await;
+                                                let res = handle_mqtt_message(msg, &mqtt_msg, &camera_msg, &speaker).await;
                                                 if res.is_err() {
                                                     tx.send(res).await?;
                                                 }
@@ -734,6 +761,7 @@ async fn handle_mqtt_message(
     msg: MqttReply,
     mqtt: &MqttInstance,
     camera: &NeoInstance,
+    speaker: &Speaker,
 ) -> Result<()> {
     match msg.as_ref() {
         MqttReplyRef {
@@ -1255,6 +1283,49 @@ async fn handle_mqtt_message(
                 .with_context(|| "Failed to publish siren")?;
         }
         MqttReplyRef {
+            topic: "control/say",
+            message,
+        } => {
+            let command = camera.config().await?.borrow().mqtt.say_command.clone();
+            let text = message.trim();
+            let reply = match command {
+                None => "FAIL: The camera has no say_command in its config".to_string(),
+                Some(_) if text.is_empty() => "FAIL: There is nothing to say".to_string(),
+                Some(command) => match speaker.say(camera, &command, text).await {
+                    Ok(()) => "OK".to_string(),
+                    Err(e) => {
+                        error!("Failed to say {text:?}: {e:?}");
+                        format!("FAIL: {e:#}")
+                    }
+                },
+            };
+            mqtt.send_message("control/say", &reply, false)
+                .await
+                .with_context(|| "Failed to publish say")?;
+        }
+        MqttReplyRef {
+            topic: "control/talk",
+            message,
+        } => {
+            let url = message.trim();
+            // Not a path: whoever can publish to the broker could play any
+            // file of the host of neolink
+            let reply = if is_web_url(url) {
+                match speaker.talk(camera, url).await {
+                    Ok(()) => "OK".to_string(),
+                    Err(e) => {
+                        error!("Failed to play {url}: {e:?}");
+                        format!("FAIL: {e:#}")
+                    }
+                }
+            } else {
+                "FAIL: Only an http or https URL plays".to_string()
+            };
+            mqtt.send_message("control/talk", &reply, false)
+                .await
+                .with_context(|| "Failed to publish talk")?;
+        }
+        MqttReplyRef {
             topic: "query/battery",
             ..
         } => {
@@ -1524,6 +1595,54 @@ mod tests {
 
         let broker_elsewhere = from_mqtt("elsewhere");
         assert_eq!(broker_elsewhere.mqtt.unwrap().credentials, None);
+    }
+
+    #[test]
+    fn a_config_sent_over_mqtt_keeps_the_say_commands_of_the_file() {
+        let config = |say: &str| -> Config {
+            toml::from_str(&format!(
+                r#"
+                [[cameras]]
+                name = "cam"
+                username = "admin"
+                address = "10.0.0.1:9000"
+                [cameras.mqtt]
+                {say}
+
+                [[cameras]]
+                name = "new"
+                username = "admin"
+                address = "10.0.0.2:9000"
+                [cameras.mqtt]
+                {say}
+                "#
+            ))
+            .unwrap()
+        };
+        let current = config(r#"say_command = ["piper"]"#);
+        let file = Some(vec!["piper".to_string()]);
+
+        for say in ["", r#"say_command = ["sh", "-c", "rm -rf ~"]"#] {
+            let mut from_mqtt = config(say);
+            keep_say_commands(&mut from_mqtt, &current);
+            assert_eq!(from_mqtt.cameras[0].mqtt.say_command, file, "{say}");
+        }
+        let mut renamed = config(r#"say_command = ["sh"]"#);
+        renamed.cameras[1].name = "renamed".to_string();
+        keep_say_commands(&mut renamed, &current);
+        assert_eq!(
+            renamed.cameras[1].mqtt.say_command, None,
+            "none for a camera the file does not have"
+        );
+    }
+
+    #[test]
+    fn only_a_web_url_plays() {
+        assert!(is_web_url("http://ha:8123/local/ding.mp3"));
+        assert!(is_web_url("HTTPS://example.com/a.wav"));
+        assert!(!is_web_url("file:///etc/shadow"));
+        assert!(!is_web_url("/root/neolink.toml"));
+        assert!(!is_web_url("http://a b"));
     }
 
     #[test]

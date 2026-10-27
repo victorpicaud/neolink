@@ -1,10 +1,10 @@
 use crate::AnyResult;
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{
-    element_error, parse::launch_full, prelude::*, Caps, ClockTime, FlowError, FlowSuccess,
+    element_error, parse::launch_full, prelude::*, Buffer, Caps, ClockTime, FlowError, FlowSuccess,
     MessageView, ParseFlags, Pipeline, ResourceError, State,
 };
-use gstreamer_app::{AppSink, AppSinkCallbacks};
+use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc, AppSrcCallbacks};
 use std::path::Path;
 use tokio::{
     sync::mpsc::{channel, Receiver, Sender},
@@ -15,11 +15,15 @@ use byte_slice_cast::*;
 
 /// Where the sound comes from
 #[derive(Clone, Copy)]
-pub(super) enum Input<'a> {
+pub(crate) enum Input<'a> {
     /// A sound file
     File(&'a Path),
     /// A GStreamer source, such as a microphone: "alsasrc device=hw:1"
     Source(&'a str),
+    /// A sound file at a URI, such as an http one
+    Uri(&'a str),
+    /// A sound file read already, such as speech
+    Data(&'a [u8]),
 }
 
 /// Plays `input` into ADPCM as the camera wants it, which the receiver gets.
@@ -155,13 +159,16 @@ fn create_pipeline(
     let source = match input {
         // Its location is set below. In the text of the pipeline, a path
         // with a space or a quote in it broke the pipeline.
-        Input::File(_) => "filesrc name=thesource",
-        Input::Source(source) => source,
+        Input::File(_) => "filesrc name=thesource ! decodebin".to_string(),
+        // Which decodes too. Its URI is set below, like a file's location.
+        Input::Uri(_) => "uridecodebin name=thesource".to_string(),
+        // Pushed below
+        Input::Data(_) => "appsrc name=thesource ! decodebin".to_string(),
+        Input::Source(source) => format!("{source} ! decodebin"),
     };
 
     let launch_str = format!(
         "{} \
-        ! decodebin \
         ! audioconvert \
         ! audioresample \
         ! audio/x-raw,rate={},channels=1 \
@@ -183,14 +190,37 @@ fn create_pipeline(
         anyhow!("Unable to create gstreamer pipeline ensure all gstramer plugins are installed")
     })?;
 
-    if let Input::File(path) = input {
-        let location = path
-            .to_str()
-            .ok_or_else(|| anyhow!("The file path {path:?} is not UTF-8"))?;
+    let source = || {
         pipeline
             .by_name("thesource")
             .expect("There should be `thesource`")
-            .set_property("location", location);
+    };
+    match input {
+        Input::File(path) => {
+            let location = path
+                .to_str()
+                .ok_or_else(|| anyhow!("The file path {path:?} is not UTF-8"))?;
+            source().set_property("location", location);
+        }
+        Input::Uri(uri) => source().set_property("uri", uri),
+        Input::Data(data) => {
+            let appsrc = source().dynamic_cast::<AppSrc>().map_err(|_| {
+                anyhow!("Cannot find appsrc in gstreamer, check your gstreamer plugins")
+            })?;
+            // All of it at once, and then the end
+            let mut data = Some(Buffer::from_slice(data.to_vec()));
+            appsrc.set_callbacks(
+                AppSrcCallbacks::builder()
+                    .need_data(move |appsrc, _| {
+                        if let Some(data) = data.take() {
+                            let _ = appsrc.push_buffer(data);
+                            let _ = appsrc.end_of_stream();
+                        }
+                    })
+                    .build(),
+            );
+        }
+        Input::Source(_) => {}
     }
 
     let appsink = get_sink(&pipeline)?;

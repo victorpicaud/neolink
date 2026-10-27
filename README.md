@@ -242,6 +242,11 @@ Control messages:
   force a wakeup for at least the given minutes, a day at most
 - `/control/siren on` Signal the siren, the message is always "on" as there is no
   "off" signal for the siren
+- `/control/say [text]` Speaks the text through the camera's speaker, with
+  the camera's `say_command` (see [Talking over MQTT](#talking-over-mqtt))
+- `/control/talk [url]` Plays the sound file at an http or https URL through
+  the camera's speaker, such as a chime that Home Assistant serves from its
+  `www` folder: `http://homeassistant.local:8123/local/chime.mp3`
 
 Status Messages:
 
@@ -396,10 +401,52 @@ Available features are:
   camera
 - `battery`: This adds a battery level sensor to home assistant
 - `siren`: Adds a siren button to home assistant
+- `talk`: Adds a text to home assistant, which the camera says once typed
+  in, and a notify entity, for automations to have the camera say things
+  with `notify.send_message`. It needs a `say_command` (see
+  [Talking over MQTT](#talking-over-mqtt))
 
 The entities are unavailable in home assistant while their camera is
 disconnected, or neolink is offline. Those of a sleeping camera stay
 available: using one wakes the camera.
+
+#### Talking over MQTT
+
+Neolink speaks the text sent to `/control/say` with a text to speech
+command of your choice: it gets the text on its standard input, and writes
+the sound to its standard output, as a WAV for instance. With
+[espeak-ng](https://github.com/espeak-ng/espeak-ng):
+
+```toml
+[[cameras]]
+  # <see above>
+  [cameras.mqtt]
+  say_command = ["espeak-ng", "-v", "en", "--stdin", "--stdout"]
+```
+
+[Piper](https://github.com/OHF-Voice/piper1-gpl) sounds far more natural.
+This script, for instance, has it write a WAV:
+
+```python
+# say.py: python say.py voice.onnx < text > speech.wav
+import io, sys, wave
+from piper import PiperVoice
+
+voice = PiperVoice.load(sys.argv[1])
+speech = io.BytesIO()
+with wave.open(speech, "wb") as wav:
+    voice.synthesize_wav(sys.stdin.read(), wav)
+sys.stdout.buffer.write(speech.getvalue())
+```
+
+```toml
+  say_command = ["/opt/piper/bin/python", "/opt/piper/say.py", "/opt/piper/en_US-lessac-medium.onnx"]
+```
+
+The say command is only ever taken from the config file: a config sent
+over MQTT keeps the file's. Sounds play one at a time, in turn, with four
+at most playing or waiting, and five minutes each at most. A camera asleep
+wakes for them.
 
 ### Extra Camera Settings
 

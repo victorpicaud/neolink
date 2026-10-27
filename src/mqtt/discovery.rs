@@ -30,6 +30,8 @@ pub(crate) enum Discoveries {
     Battery,
     #[serde(alias = "siren", alias = "alarm")]
     Siren,
+    #[serde(alias = "talk", alias = "say", alias = "voice", alias = "speaker")]
+    Talk,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +203,33 @@ struct DiscoveryButton {
     command_topic: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload_press: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct DiscoveryText {
+    name: String,
+    unique_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    device: DiscoveryDevice,
+    #[serde(flatten)]
+    availability: Availability,
+    // Text specific
+    command_topic: String,
+    max: u16,
+}
+
+#[derive(Serialize, Debug)]
+struct DiscoveryNotify {
+    name: String,
+    unique_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
+    device: DiscoveryDevice,
+    #[serde(flatten)]
+    availability: Availability,
+    // Notify specific
+    command_topic: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -655,6 +684,75 @@ pub(crate) async fn enable_discovery(
                 .with_context(|| {
                     format!(
                         "Failed to publish sire auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+            }
+            Discoveries::Talk => {
+                // What the camera says, typed on a dashboard
+                let config_data = DiscoveryText {
+                    // Common across all potential features
+                    device: device.clone(),
+                    availability: availability.clone(),
+
+                    // Identifiers
+                    name: format!("{} Say", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_say", cam_config.name),
+                    icon: Some("mdi:account-voice".to_string()),
+
+                    // Text specific
+                    command_topic: format!("neolink/{}/control/say", cam_config.name),
+                    // The most Home Assistant takes
+                    max: 255,
+                };
+
+                // Each feature needs to be individually registered
+                mqtt.send_message_with_root_topic(
+                    &format!("{}/text/{}", discovery_config.topic, config_data.unique_id),
+                    "config",
+                    &serde_json::to_string(&config_data)
+                        .with_context(|| "Cound not serialise discovery say config into json")?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish say auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+
+                // What automations have it say, with notify.send_message
+                let config_data = DiscoveryNotify {
+                    // Common across all potential features
+                    device: device.clone(),
+                    availability: availability.clone(),
+
+                    // Identifiers
+                    name: format!("{} Speaker", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_speaker", cam_config.name),
+                    icon: Some("mdi:speaker-message".to_string()),
+
+                    // Notify specific
+                    command_topic: format!("neolink/{}/control/say", cam_config.name),
+                };
+
+                // Each feature needs to be individually registered
+                mqtt.send_message_with_root_topic(
+                    &format!(
+                        "{}/notify/{}",
+                        discovery_config.topic, config_data.unique_id
+                    ),
+                    "config",
+                    &serde_json::to_string(&config_data).with_context(|| {
+                        "Cound not serialise discovery speaker config into json"
+                    })?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish speaker auto-discover data on over MQTT for {}",
                         cam_config.name
                     )
                 })?;

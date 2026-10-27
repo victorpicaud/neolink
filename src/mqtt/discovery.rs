@@ -32,6 +32,10 @@ pub(crate) enum Discoveries {
     Siren,
     #[serde(alias = "talk", alias = "say", alias = "voice", alias = "speaker")]
     Talk,
+    #[serde(alias = "pir_switch", alias = "pir_enabled")]
+    PirSwitch,
+    #[serde(alias = "wakeup", alias = "wake_up", alias = "wake")]
+    Wakeup,
 }
 
 #[derive(Debug, Clone)]
@@ -757,6 +761,81 @@ pub(crate) async fn enable_discovery(
                     )
                 })?;
             }
+            Discoveries::PirSwitch => {
+                let config_data = DiscoverySwitch {
+                    // Common across all potential features
+                    device: device.clone(),
+                    availability: availability.clone(),
+
+                    // Identifiers
+                    name: format!("{} PIR", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_pir", cam_config.name),
+                    icon: Some("mdi:motion-sensor".to_string()),
+
+                    // Switch specific
+                    command_topic: format!("neolink/{}/control/pir", cam_config.name),
+                    payload_off: "off".to_string(),
+                    payload_on: "on".to_string(),
+                    state_topic: None,
+                    state_off: None,
+                    state_on: None,
+                };
+
+                // Each feature needs to be individually registered
+                mqtt.send_message_with_root_topic(
+                    &format!(
+                        "{}/switch/{}",
+                        discovery_config.topic, config_data.unique_id
+                    ),
+                    "config",
+                    &serde_json::to_string(&config_data)
+                        .with_context(|| "Cound not serialise discovery pir config into json")?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish pir auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+            }
+            Discoveries::Wakeup => {
+                let config_data = DiscoveryButton {
+                    // Common across all potential features
+                    device: device.clone(),
+                    availability: availability.clone(),
+
+                    // Identifiers
+                    name: format!("{} Wake Up", friendly_name.as_str()),
+                    unique_id: format!("neolink_{}_wakeup", cam_config.name),
+                    icon: Some("mdi:sleep-off".to_string()),
+
+                    // Button specific: for five minutes, long enough for its
+                    // preview and battery level to be updated
+                    command_topic: format!("neolink/{}/control/wakeup", cam_config.name),
+                    payload_press: Some("5".to_string()),
+                };
+
+                // Each feature needs to be individually registered
+                mqtt.send_message_with_root_topic(
+                    &format!(
+                        "{}/button/{}",
+                        discovery_config.topic, config_data.unique_id
+                    ),
+                    "config",
+                    &serde_json::to_string(&config_data)
+                        .with_context(|| "Cound not serialise discovery wakeup config into json")?,
+                    true,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to publish wakeup auto-discover data on over MQTT for {}",
+                        cam_config.name
+                    )
+                })?;
+            }
         }
     }
 
@@ -772,6 +851,19 @@ pub(crate) async fn enable_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_feature_is_known_by_its_name_in_the_readme() {
+        for (name, feature) in [
+            ("talk", Discoveries::Talk),
+            ("pir_switch", Discoveries::PirSwitch),
+            ("wakeup", Discoveries::Wakeup),
+            ("pir", Discoveries::Motion),
+        ] {
+            let parsed: Discoveries = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            assert_eq!(parsed, feature, "{name}");
+        }
+    }
 
     #[test]
     fn an_entity_is_unavailable_when_its_camera_or_neolink_is_gone() {

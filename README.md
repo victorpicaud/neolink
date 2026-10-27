@@ -405,6 +405,10 @@ Available features are:
   in, and a notify entity, for automations to have the camera say things
   with `notify.send_message`. It needs a `say_command` (see
   [Talking over MQTT](#talking-over-mqtt))
+- `pir_switch`: Adds a switch to home assistant that turns the camera's PIR
+  motion sensor on and off
+- `wakeup`: Adds a button to home assistant that wakes a sleeping camera for
+  five minutes: long enough for its preview and battery level to be updated
 
 The entities are unavailable in home assistant while their camera is
 disconnected, or neolink is offline. Those of a sleeping camera stay

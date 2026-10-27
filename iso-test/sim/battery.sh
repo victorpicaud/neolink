@@ -5,6 +5,8 @@
 #   - a command wakes it, and it sleeps again after
 #   - a camera that cannot be reached when needed is disconnected, once it
 #     had its minute to wake
+#   - discovery gives Home Assistant a button to wake it, and a switch for
+#     its PIR
 # Needs mosquitto on PATH.
 #
 # Usage: iso-test/sim/battery.sh [--release]
@@ -23,7 +25,7 @@ FAKECAM_PID=${PIDS[-1]}
   echo 'idle_disconnect = true'
   echo '[cameras.mqtt.discovery]'
   echo 'topic = "homeassistant"'
-  echo 'features = ["reboot"]'
+  echo 'features = ["reboot", "wakeup", "pir_switch"]'
 } > "$WORK/neolink.toml"
 start_neolink "$WORK/neolink.toml" mqtt
 
@@ -54,6 +56,12 @@ if retained homeassistant/button/neolink_b_reboot/b/config | grep -qF "if value 
   echo "ok: in Home Assistant, a sleeping camera's entities are available"
 else
   flunk "discovery does not keep a sleeping camera's entities available"
+fi
+if retained homeassistant/button/neolink_b_wakeup/b/config | grep -qF '"command_topic":"neolink/b/control/wakeup","payload_press":"5"' \
+  && retained homeassistant/switch/neolink_b_pir/b/config | grep -qF '"command_topic":"neolink/b/control/pir"'; then
+  echo "ok: discovery gives Home Assistant a button to wake the camera, and a switch for its PIR"
+else
+  flunk "discovery gives no button to wake the camera, or no switch for its PIR"
 fi
 
 mosquitto_pub "${MQTT[@]}" -t neolink/b/control/wakeup -m 0
